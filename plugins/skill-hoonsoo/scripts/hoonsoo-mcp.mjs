@@ -1,0 +1,1216 @@
+#!/usr/bin/env node
+
+import { createInterface } from "node:readline";
+import { open, stat } from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { TextDecoder } from "node:util";
+import { fileURLToPath } from "node:url";
+
+export const MAX_FILE_BYTES = 5 * 1024 * 1024;
+export const MAX_WAIT_MS = 50_000;
+export const DEFAULT_SNAPSHOT_CHARACTERS = 32_000;
+export const MAX_SNAPSHOT_CHARACTERS = 65_536;
+export const MAX_DELTA_CHARACTERS = 24_000;
+
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_SETTLE_MS = 250;
+const DEFAULT_CONTEXT_LINES = 5;
+const MAX_EVENT_HISTORY = 64;
+const MAX_FINE_DIFF_LINES = 100_000;
+const MAX_LCS_CELLS = 1_000_000;
+const MAX_LCS_OPERATION_LINES = 10_000;
+const MAX_DELTA_LINES = 200;
+const MAX_DELTA_TEXT_CHARACTERS = 12_000;
+const READ_CHUNK_BYTES = 64 * 1024;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const SERVER_NAME = "hoonsoo";
+const SERVER_VERSION = "0.1.0";
+const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+const TOOL_DEFINITIONS = [
+  {
+    name: "start_monitor",
+    description:
+      "Start an in-memory, read-only monitor for one UTF-8 regular file. The path must be absolute. This tool never writes to the target or workspace.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string", description: "Absolute path to the regular file." },
+        pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 2_000 },
+        settleMs: { type: "integer", minimum: 0, maximum: 10_000, default: 250 },
+        contextLines: { type: "integer", minimum: 0, maximum: 50, default: 5 },
+      },
+    },
+    annotations: {
+      title: "Start Hoonsoo monitor",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "read_snapshot",
+    description:
+      "Read one bounded page from the monitor's current in-memory snapshot. Use nextOffset until hasMore is false.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId"],
+      properties: {
+        monitorId: { type: "string" },
+        offset: { type: "integer", minimum: 0, default: 0 },
+        maxCharacters: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_SNAPSHOT_CHARACTERS,
+          default: DEFAULT_SNAPSHOT_CHARACTERS,
+        },
+      },
+    },
+    annotations: {
+      title: "Read Hoonsoo snapshot",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "wait_for_change",
+    description:
+      "Wait for the next changed, replaced, or deleted event after a revision. Waiting is capped at 50 seconds and delta payloads are bounded.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId"],
+      properties: {
+        monitorId: { type: "string" },
+        afterRevision: { type: "integer", minimum: 0, default: 0 },
+        timeoutMs: { type: "integer", minimum: 0, maximum: MAX_WAIT_MS, default: MAX_WAIT_MS },
+      },
+    },
+    annotations: {
+      title: "Wait for Hoonsoo change",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "get_status",
+    description: "Get read-only status metadata for one monitor, or for every monitor in this server session.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: { monitorId: { type: "string" } },
+    },
+    annotations: {
+      title: "Get Hoonsoo status",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "stop_monitor",
+    description: "Stop a monitor and release its timers. The target file is not modified.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId"],
+      properties: { monitorId: { type: "string" } },
+    },
+    annotations: {
+      title: "Stop Hoonsoo monitor",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+];
+
+export class HoonsooError extends Error {
+  constructor(code, message, details = undefined) {
+    super(message);
+    this.name = "HoonsooError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function assertObject(value, label = "arguments") {
+  if (value === undefined) return {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new HoonsooError("INVALID_ARGUMENT", `${label} must be an object.`);
+  }
+  return value;
+}
+
+function integerOption(value, name, fallback, minimum, maximum) {
+  const resolved = value === undefined ? fallback : value;
+  if (!Number.isInteger(resolved) || resolved < minimum || resolved > maximum) {
+    throw new HoonsooError(
+      "INVALID_ARGUMENT",
+      `${name} must be an integer between ${minimum} and ${maximum}.`,
+    );
+  }
+  return resolved;
+}
+
+function requireString(value, name) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new HoonsooError("INVALID_ARGUMENT", `${name} must be a non-empty string.`);
+  }
+  return value;
+}
+
+export function normalizeTargetPath(inputPath) {
+  requireString(inputPath, "path");
+  if (inputPath.includes("\0")) {
+    throw new HoonsooError("INVALID_PATH", "path must not contain a NUL byte.");
+  }
+  if (!path.isAbsolute(inputPath)) {
+    throw new HoonsooError("INVALID_PATH", "path must be absolute.");
+  }
+  return path.normalize(path.resolve(inputPath));
+}
+
+function internalMetadata(fileStat) {
+  const mtimeNs = fileStat.mtimeNs ?? BigInt(Math.trunc(fileStat.mtimeMs * 1_000_000));
+  const ctimeNs = fileStat.ctimeNs ?? BigInt(Math.trunc(fileStat.ctimeMs * 1_000_000));
+  return {
+    dev: fileStat.dev.toString(),
+    ino: fileStat.ino.toString(),
+    size: Number(fileStat.size),
+    mtimeNs: mtimeNs.toString(),
+    ctimeNs: ctimeNs.toString(),
+  };
+}
+
+function metadataSignature(metadata) {
+  return `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeNs}:${metadata.ctimeNs}`;
+}
+
+function identitySignature(metadata) {
+  return `${metadata.dev}:${metadata.ino}`;
+}
+
+function publicMetadata(metadata) {
+  if (!metadata) return null;
+  return {
+    sizeBytes: metadata.size,
+    modifiedTimeNanoseconds: metadata.mtimeNs,
+    device: metadata.dev,
+    inode: metadata.ino,
+  };
+}
+
+function translateFileError(error, targetPath) {
+  if (error instanceof HoonsooError) return error;
+  if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+    return new HoonsooError("TARGET_NOT_FOUND", `Target does not exist: ${targetPath}`);
+  }
+  if (error?.code === "EACCES" || error?.code === "EPERM") {
+    return new HoonsooError("TARGET_NOT_READABLE", `Target is not readable: ${targetPath}`);
+  }
+  return new HoonsooError("TARGET_READ_FAILED", `Failed to read target: ${targetPath}`, {
+    cause: error?.code ?? error?.message ?? String(error),
+  });
+}
+
+async function probeMetadata(targetPath) {
+  try {
+    const fileStat = await stat(targetPath, { bigint: true });
+    if (!fileStat.isFile()) {
+      throw new HoonsooError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
+    }
+    if (fileStat.size > BigInt(MAX_FILE_BYTES)) {
+      throw new HoonsooError(
+        "TARGET_TOO_LARGE",
+        `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
+      );
+    }
+    return internalMetadata(fileStat);
+  } catch (error) {
+    throw translateFileError(error, targetPath);
+  }
+}
+
+async function readOpenedFileBounded(fileHandle, targetPath) {
+  const chunks = [];
+  let totalBytes = 0;
+  let position = 0;
+
+  while (true) {
+    const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, position);
+    if (bytesRead === 0) break;
+    totalBytes += bytesRead;
+    if (totalBytes > MAX_FILE_BYTES) {
+      throw new HoonsooError(
+        "TARGET_TOO_LARGE",
+        `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
+      );
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+
+  const bytes = Buffer.concat(chunks, totalBytes);
+  try {
+    return UTF8_DECODER.decode(bytes);
+  } catch {
+    throw new HoonsooError("TARGET_NOT_UTF8", `Target is not valid UTF-8: ${targetPath}`);
+  }
+}
+
+async function readPathOnce(targetPath) {
+  let fileHandle;
+  try {
+    fileHandle = await open(targetPath, "r");
+    const beforeStat = await fileHandle.stat({ bigint: true });
+    if (!beforeStat.isFile()) {
+      throw new HoonsooError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
+    }
+    if (beforeStat.size > BigInt(MAX_FILE_BYTES)) {
+      throw new HoonsooError(
+        "TARGET_TOO_LARGE",
+        `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
+      );
+    }
+    const before = internalMetadata(beforeStat);
+    const text = await readOpenedFileBounded(fileHandle, targetPath);
+    const after = internalMetadata(await fileHandle.stat({ bigint: true }));
+    const pathMetadata = await probeMetadata(targetPath);
+    if (
+      metadataSignature(before) !== metadataSignature(after) ||
+      metadataSignature(after) !== metadataSignature(pathMetadata)
+    ) {
+      throw new HoonsooError("TARGET_CHANGED_DURING_READ", `Target changed while being read: ${targetPath}`);
+    }
+    return { text, metadata: after };
+  } catch (error) {
+    throw translateFileError(error, targetPath);
+  } finally {
+    await fileHandle?.close().catch(() => {});
+  }
+}
+
+async function readStablePath(targetPath, settleMs, attempts = 3) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await readPathOnce(targetPath);
+    } catch (error) {
+      lastError = error;
+      if (error.code !== "TARGET_CHANGED_DURING_READ" || attempt === attempts - 1) throw error;
+      await sleep(settleMs);
+    }
+  }
+  throw lastError;
+}
+
+function countLines(text) {
+  if (text.length === 0) return 0;
+  let count = 1;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10) count += 1;
+  }
+  return count;
+}
+
+function operation(type, oldLine, newLine, text) {
+  return { type, oldLine, newLine, text };
+}
+
+function lcsMiddleOperations(oldLines, newLines, oldOffset, newOffset) {
+  const rows = oldLines.length + 1;
+  const columns = newLines.length + 1;
+  const cells = rows * columns;
+  if (cells > MAX_LCS_CELLS || oldLines.length + newLines.length > MAX_LCS_OPERATION_LINES) {
+    return null;
+  }
+
+  const table = new Uint32Array(cells);
+  for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex -= 1) {
+      const current = oldIndex * columns + newIndex;
+      if (oldLines[oldIndex] === newLines[newIndex]) {
+        table[current] = table[(oldIndex + 1) * columns + newIndex + 1] + 1;
+      } else {
+        table[current] = Math.max(
+          table[(oldIndex + 1) * columns + newIndex],
+          table[oldIndex * columns + newIndex + 1],
+        );
+      }
+    }
+  }
+
+  const operations = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < oldLines.length && newIndex < newLines.length) {
+    if (oldLines[oldIndex] === newLines[newIndex]) {
+      operations.push(
+        operation("context", oldOffset + oldIndex + 1, newOffset + newIndex + 1, oldLines[oldIndex]),
+      );
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (
+      table[(oldIndex + 1) * columns + newIndex] >= table[oldIndex * columns + newIndex + 1]
+    ) {
+      operations.push(
+        operation("delete", oldOffset + oldIndex + 1, newOffset + newIndex + 1, oldLines[oldIndex]),
+      );
+      oldIndex += 1;
+    } else {
+      operations.push(
+        operation("add", oldOffset + oldIndex + 1, newOffset + newIndex + 1, newLines[newIndex]),
+      );
+      newIndex += 1;
+    }
+  }
+  while (oldIndex < oldLines.length) {
+    operations.push(
+      operation("delete", oldOffset + oldIndex + 1, newOffset + newIndex + 1, oldLines[oldIndex]),
+    );
+    oldIndex += 1;
+  }
+  while (newIndex < newLines.length) {
+    operations.push(
+      operation("add", oldOffset + oldIndex + 1, newOffset + newIndex + 1, newLines[newIndex]),
+    );
+    newIndex += 1;
+  }
+  return operations;
+}
+
+function coarseReplacementHunk(
+  oldLines,
+  newLines,
+  prefixLength,
+  suffixLength,
+  allOldLines,
+  allNewLines,
+  contextLines,
+) {
+  const lines = [];
+  const leadingStart = Math.max(0, prefixLength - contextLines);
+  for (let index = leadingStart; index < prefixLength; index += 1) {
+    lines.push(operation("context", index + 1, index + 1, allOldLines[index]));
+  }
+
+  const previewLimit = Math.max(1, Math.floor((MAX_DELTA_LINES - contextLines * 2) / 2));
+  for (let index = 0; index < Math.min(oldLines.length, previewLimit); index += 1) {
+    lines.push(operation("delete", prefixLength + index + 1, prefixLength + 1, oldLines[index]));
+  }
+  for (let index = 0; index < Math.min(newLines.length, previewLimit); index += 1) {
+    lines.push(
+      operation("add", prefixLength + oldLines.length + 1, prefixLength + index + 1, newLines[index]),
+    );
+  }
+
+  for (let index = 0; index < Math.min(suffixLength, contextLines); index += 1) {
+    const oldIndex = allOldLines.length - suffixLength + index;
+    const newIndex = allNewLines.length - suffixLength + index;
+    lines.push(operation("context", oldIndex + 1, newIndex + 1, allOldLines[oldIndex]));
+  }
+
+  return {
+    oldStart: leadingStart + 1,
+    oldCount: prefixLength - leadingStart + oldLines.length + Math.min(suffixLength, contextLines),
+    newStart: leadingStart + 1,
+    newCount: prefixLength - leadingStart + newLines.length + Math.min(suffixLength, contextLines),
+    lines,
+  };
+}
+
+function makeHunks(operations, contextLines) {
+  const changedIndexes = [];
+  for (let index = 0; index < operations.length; index += 1) {
+    if (operations[index].type !== "context") changedIndexes.push(index);
+  }
+  if (changedIndexes.length === 0) return [];
+
+  const ranges = [];
+  let first = changedIndexes[0];
+  let last = first;
+  for (let index = 1; index < changedIndexes.length; index += 1) {
+    const next = changedIndexes[index];
+    if (next - last - 1 <= contextLines * 2) {
+      last = next;
+    } else {
+      ranges.push([Math.max(0, first - contextLines), Math.min(operations.length - 1, last + contextLines)]);
+      first = next;
+      last = next;
+    }
+  }
+  ranges.push([Math.max(0, first - contextLines), Math.min(operations.length - 1, last + contextLines)]);
+
+  return ranges.map(([start, end]) => {
+    const lines = operations.slice(start, end + 1);
+    const oldAffected = lines.filter((line) => line.type !== "add");
+    const newAffected = lines.filter((line) => line.type !== "delete");
+    return {
+      oldStart: lines[0].oldLine,
+      oldCount: oldAffected.length,
+      newStart: lines[0].newLine,
+      newCount: newAffected.length,
+      lines,
+    };
+  });
+}
+
+function truncateDelta(delta) {
+  let includedLines = 0;
+  let includedTextCharacters = 0;
+  let truncated = delta.truncated;
+  const hunks = [];
+
+  outer: for (const hunk of delta.hunks) {
+    const lines = [];
+    for (const line of hunk.lines) {
+      if (includedLines >= MAX_DELTA_LINES) {
+        truncated = true;
+        break outer;
+      }
+      const remaining = MAX_DELTA_TEXT_CHARACTERS - includedTextCharacters;
+      if (remaining <= 0) {
+        truncated = true;
+        break outer;
+      }
+      let text = line.text;
+      if (text.length > remaining) {
+        text = `${text.slice(0, Math.max(0, remaining - 1))}…`;
+        truncated = true;
+      }
+      lines.push({ ...line, text });
+      includedLines += 1;
+      includedTextCharacters += text.length;
+      if (text.length !== line.text.length) break outer;
+    }
+    if (lines.length > 0) hunks.push({ ...hunk, lines });
+  }
+
+  const bounded = {
+    ...delta,
+    hunks,
+    truncated,
+    truncationReason: truncated ? delta.truncationReason ?? "delta-payload-limit" : null,
+    includedLineOperations: includedLines,
+  };
+
+  while (JSON.stringify(bounded).length > MAX_DELTA_CHARACTERS && bounded.hunks.length > 0) {
+    const lastHunk = bounded.hunks.at(-1);
+    lastHunk.lines.pop();
+    bounded.includedLineOperations -= 1;
+    bounded.truncated = true;
+    bounded.truncationReason = "delta-payload-limit";
+    if (lastHunk.lines.length === 0) bounded.hunks.pop();
+  }
+  return bounded;
+}
+
+function extremelyLargeLineDelta(previousText, currentText, contextLines) {
+  const oldLineCount = countLines(previousText);
+  const newLineCount = countLines(currentText);
+  const previewLimit = Math.min(MAX_DELTA_TEXT_CHARACTERS / 2, 4_000);
+  const oldPreview = previousText.slice(0, previewLimit).split("\n").slice(0, contextLines + 1);
+  const newPreview = currentText.slice(0, previewLimit).split("\n").slice(0, contextLines + 1);
+  const lines = [
+    ...oldPreview.map((text, index) => operation("delete", index + 1, 1, text)),
+    ...newPreview.map((text, index) => operation("add", oldLineCount + 1, index + 1, text)),
+  ];
+  return truncateDelta({
+    algorithm: "bounded-line-replacement",
+    oldLineCount,
+    newLineCount,
+    additions: newLineCount,
+    deletions: oldLineCount,
+    contextLines,
+    hunks: [
+      {
+        oldStart: 1,
+        oldCount: oldLineCount,
+        newStart: 1,
+        newCount: newLineCount,
+        lines,
+      },
+    ],
+    truncated: true,
+    truncationReason: "line-count-limit",
+  });
+}
+
+export function computeLineDelta(previousText, currentText, contextLines = DEFAULT_CONTEXT_LINES) {
+  if (previousText === currentText) {
+    return {
+      algorithm: "bounded-lcs-line",
+      oldLineCount: countLines(previousText),
+      newLineCount: countLines(currentText),
+      additions: 0,
+      deletions: 0,
+      contextLines,
+      hunks: [],
+      truncated: false,
+      truncationReason: null,
+      includedLineOperations: 0,
+    };
+  }
+
+  const oldLineCount = countLines(previousText);
+  const newLineCount = countLines(currentText);
+  if (oldLineCount > MAX_FINE_DIFF_LINES || newLineCount > MAX_FINE_DIFF_LINES) {
+    return extremelyLargeLineDelta(previousText, currentText, contextLines);
+  }
+
+  const oldLines = previousText.length === 0 ? [] : previousText.split("\n");
+  const newLines = currentText.length === 0 ? [] : currentText.split("\n");
+  let prefixLength = 0;
+  while (
+    prefixLength < oldLines.length &&
+    prefixLength < newLines.length &&
+    oldLines[prefixLength] === newLines[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < oldLines.length - prefixLength &&
+    suffixLength < newLines.length - prefixLength &&
+    oldLines[oldLines.length - suffixLength - 1] === newLines[newLines.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+
+  const oldMiddle = oldLines.slice(prefixLength, oldLines.length - suffixLength);
+  const newMiddle = newLines.slice(prefixLength, newLines.length - suffixLength);
+  let middleOperations = lcsMiddleOperations(oldMiddle, newMiddle, prefixLength, prefixLength);
+  const usedCoarseFallback = middleOperations === null;
+  if (usedCoarseFallback) {
+    return truncateDelta({
+      algorithm: "bounded-line-replacement",
+      oldLineCount: oldLines.length,
+      newLineCount: newLines.length,
+      additions: newMiddle.length,
+      deletions: oldMiddle.length,
+      contextLines,
+      hunks: [
+        coarseReplacementHunk(
+          oldMiddle,
+          newMiddle,
+          prefixLength,
+          suffixLength,
+          oldLines,
+          newLines,
+          contextLines,
+        ),
+      ],
+      truncated: true,
+      truncationReason: "lcs-cell-limit",
+    });
+  }
+
+  const operations = [];
+  const leadingContextStart = Math.max(0, prefixLength - contextLines);
+  for (let index = leadingContextStart; index < prefixLength; index += 1) {
+    operations.push(operation("context", index + 1, index + 1, oldLines[index]));
+  }
+  for (const item of middleOperations) operations.push(item);
+  for (let index = 0; index < Math.min(suffixLength, contextLines); index += 1) {
+    const oldIndex = oldLines.length - suffixLength + index;
+    const newIndex = newLines.length - suffixLength + index;
+    operations.push(operation("context", oldIndex + 1, newIndex + 1, oldLines[oldIndex]));
+  }
+
+  const additions = middleOperations.filter((item) => item.type === "add").length;
+  const deletions = middleOperations.filter((item) => item.type === "delete").length;
+  return truncateDelta({
+    algorithm: "bounded-lcs-line",
+    oldLineCount: oldLines.length,
+    newLineCount: newLines.length,
+    additions,
+    deletions,
+    contextLines,
+    hunks: makeHunks(operations, contextLines),
+    truncated: false,
+    truncationReason: null,
+  });
+}
+
+function pageText(text, offset, maxCharacters) {
+  if (offset > text.length) {
+    throw new HoonsooError(
+      "INVALID_ARGUMENT",
+      `offset ${offset} is beyond the snapshot length ${text.length}.`,
+    );
+  }
+  let end = Math.min(text.length, offset + maxCharacters);
+  if (end < text.length) {
+    const last = text.charCodeAt(end - 1);
+    const next = text.charCodeAt(end);
+    if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
+  }
+  const content = text.slice(offset, end);
+  return {
+    content,
+    pagination: {
+      offset,
+      returnedCharacters: content.length,
+      totalCharacters: text.length,
+      nextOffset: end < text.length ? end : null,
+      hasMore: end < text.length,
+    },
+  };
+}
+
+function eventResult(event, historyTruncated = false) {
+  return {
+    state: "changed",
+    historyTruncated,
+    rebaselineRequired: historyTruncated,
+    event,
+  };
+}
+
+export class MonitorSession {
+  constructor() {
+    this.monitors = new Map();
+    this.activeByPath = new Map();
+    this.nextMonitorNumber = 1;
+    this.closed = false;
+  }
+
+  async startMonitor(input) {
+    const args = assertObject(input);
+    const targetPath = normalizeTargetPath(args.path);
+    const pollIntervalMs = integerOption(
+      args.pollIntervalMs,
+      "pollIntervalMs",
+      DEFAULT_POLL_INTERVAL_MS,
+      25,
+      60_000,
+    );
+    const settleMs = integerOption(args.settleMs, "settleMs", DEFAULT_SETTLE_MS, 0, 10_000);
+    const contextLines = integerOption(
+      args.contextLines,
+      "contextLines",
+      DEFAULT_CONTEXT_LINES,
+      0,
+      50,
+    );
+
+    const activeId = this.activeByPath.get(targetPath);
+    const active = activeId ? this.monitors.get(activeId) : undefined;
+    if (active?.status === "active") {
+      active.pollIntervalMs = pollIntervalMs;
+      active.settleMs = settleMs;
+      active.contextLines = contextLines;
+      this.#restartPollTimer(active);
+      return { ...this.#status(active), reused: true };
+    }
+
+    const snapshot = await readStablePath(targetPath, settleMs);
+    const monitor = {
+      id: `monitor-${this.nextMonitorNumber++}`,
+      path: targetPath,
+      status: "active",
+      reason: null,
+      error: null,
+      revision: 0,
+      snapshot,
+      pollIntervalMs,
+      settleMs,
+      contextLines,
+      startedAt: new Date().toISOString(),
+      lastEventAt: null,
+      events: [],
+      waiters: new Set(),
+      pollTimer: null,
+      settleTimer: null,
+      pendingKey: null,
+      polling: false,
+    };
+    this.monitors.set(monitor.id, monitor);
+    this.activeByPath.set(targetPath, monitor.id);
+    this.#restartPollTimer(monitor);
+    return { ...this.#status(monitor), reused: false };
+  }
+
+  readSnapshot(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const offset = integerOption(args.offset, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
+    const maxCharacters = integerOption(
+      args.maxCharacters,
+      "maxCharacters",
+      DEFAULT_SNAPSHOT_CHARACTERS,
+      1,
+      MAX_SNAPSHOT_CHARACTERS,
+    );
+    return {
+      monitorId: monitor.id,
+      path: monitor.path,
+      revision: monitor.revision,
+      status: monitor.status,
+      metadata: publicMetadata(monitor.snapshot.metadata),
+      ...pageText(monitor.snapshot.text, offset, maxCharacters),
+    };
+  }
+
+  waitForChange(input, signal = undefined) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const afterRevision = integerOption(
+      args.afterRevision,
+      "afterRevision",
+      0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const timeoutMs = integerOption(args.timeoutMs, "timeoutMs", MAX_WAIT_MS, 0, MAX_WAIT_MS);
+    if (afterRevision > monitor.revision) {
+      throw new HoonsooError(
+        "REVISION_AHEAD",
+        `afterRevision ${afterRevision} is ahead of current revision ${monitor.revision}. Re-read status or snapshot before waiting.`,
+      );
+    }
+    const event = monitor.events.find((candidate) => candidate.revision > afterRevision);
+    if (event) {
+      return Promise.resolve(
+        eventResult(event, monitor.events[0]?.revision > afterRevision + 1),
+      );
+    }
+    if (monitor.status === "error") {
+      return Promise.resolve({ state: "error", ...this.#status(monitor) });
+    }
+    if (monitor.status !== "active") {
+      return Promise.resolve({ state: "stopped", ...this.#status(monitor) });
+    }
+    if (timeoutMs === 0) {
+      return Promise.resolve({
+        state: "timeout",
+        monitorId: monitor.id,
+        revision: monitor.revision,
+        status: monitor.status,
+      });
+    }
+
+    return new Promise((resolve) => {
+      const waiter = {
+        afterRevision,
+        resolve: (result) => {
+          clearTimeout(waiter.timer);
+          signal?.removeEventListener("abort", waiter.abort);
+          monitor.waiters.delete(waiter);
+          resolve(result);
+        },
+        abort: () => {
+          waiter.resolve({
+            state: "cancelled",
+            monitorId: monitor.id,
+            revision: monitor.revision,
+            status: monitor.status,
+          });
+        },
+        timer: null,
+      };
+      waiter.timer = setTimeout(() => {
+        waiter.resolve({
+          state: "timeout",
+          monitorId: monitor.id,
+          revision: monitor.revision,
+          status: monitor.status,
+        });
+      }, timeoutMs);
+      monitor.waiters.add(waiter);
+      signal?.addEventListener("abort", waiter.abort, { once: true });
+      if (signal?.aborted) waiter.abort();
+    });
+  }
+
+  getStatus(input = {}) {
+    const args = assertObject(input);
+    if (args.monitorId !== undefined) return this.#status(this.#requireMonitor(args.monitorId));
+    return { monitors: [...this.monitors.values()].map((monitor) => this.#status(monitor)) };
+  }
+
+  stopMonitor(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    if (monitor.status === "active") this.#stop(monitor, "user-stopped", "stopped");
+    return this.#status(monitor);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const monitor of this.monitors.values()) {
+      if (monitor.status === "active") this.#stop(monitor, "session-ended", "stopped");
+    }
+  }
+
+  #requireMonitor(monitorId) {
+    requireString(monitorId, "monitorId");
+    const monitor = this.monitors.get(monitorId);
+    if (!monitor) throw new HoonsooError("MONITOR_NOT_FOUND", `Unknown monitorId: ${monitorId}`);
+    return monitor;
+  }
+
+  #status(monitor) {
+    return {
+      monitorId: monitor.id,
+      path: monitor.path,
+      status: monitor.status,
+      reason: monitor.reason,
+      error: monitor.error,
+      revision: monitor.revision,
+      metadata: publicMetadata(monitor.snapshot.metadata),
+      pollIntervalMs: monitor.pollIntervalMs,
+      settleMs: monitor.settleMs,
+      contextLines: monitor.contextLines,
+      startedAt: monitor.startedAt,
+      lastEventAt: monitor.lastEventAt,
+    };
+  }
+
+  #restartPollTimer(monitor) {
+    clearInterval(monitor.pollTimer);
+    monitor.pollTimer = setInterval(() => {
+      void this.#poll(monitor);
+    }, monitor.pollIntervalMs);
+    monitor.pollTimer.unref?.();
+  }
+
+  async #poll(monitor) {
+    if (monitor.status !== "active" || monitor.polling) return;
+    monitor.polling = true;
+    try {
+      const metadata = await probeMetadata(monitor.path);
+      if (metadataSignature(metadata) === metadataSignature(monitor.snapshot.metadata)) {
+        this.#clearPending(monitor);
+        return;
+      }
+      this.#scheduleSettle(monitor, `present:${metadataSignature(metadata)}`);
+    } catch (error) {
+      if (error.code === "TARGET_NOT_FOUND") {
+        this.#scheduleSettle(monitor, "missing");
+      } else {
+        this.#fail(monitor, error);
+      }
+    } finally {
+      monitor.polling = false;
+    }
+  }
+
+  #scheduleSettle(monitor, pendingKey) {
+    if (monitor.pendingKey === pendingKey && monitor.settleTimer) return;
+    clearTimeout(monitor.settleTimer);
+    monitor.pendingKey = pendingKey;
+    monitor.settleTimer = setTimeout(() => {
+      monitor.settleTimer = null;
+      void this.#settle(monitor, pendingKey);
+    }, monitor.settleMs);
+    monitor.settleTimer.unref?.();
+  }
+
+  #clearPending(monitor) {
+    clearTimeout(monitor.settleTimer);
+    monitor.settleTimer = null;
+    monitor.pendingKey = null;
+  }
+
+  async #settle(monitor, expectedKey) {
+    if (monitor.status !== "active" || monitor.pendingKey !== expectedKey) return;
+    try {
+      let metadata;
+      try {
+        metadata = await probeMetadata(monitor.path);
+      } catch (error) {
+        if (error.code === "TARGET_NOT_FOUND") {
+          if (expectedKey !== "missing") {
+            this.#scheduleSettle(monitor, "missing");
+            return;
+          }
+          const previous = monitor.snapshot;
+          monitor.snapshot = { text: "", metadata: null };
+          monitor.revision += 1;
+          this.#emit(monitor, {
+            type: "deleted",
+            monitorId: monitor.id,
+            path: monitor.path,
+            revision: monitor.revision,
+            previousRevision: monitor.revision - 1,
+            observedAt: new Date().toISOString(),
+            metadata: null,
+            delta: computeLineDelta(previous.text, "", monitor.contextLines),
+          });
+          this.#stop(monitor, "target-deleted", "stopped");
+          return;
+        }
+        throw error;
+      }
+
+      const currentKey = `present:${metadataSignature(metadata)}`;
+      if (currentKey !== expectedKey) {
+        this.#scheduleSettle(monitor, currentKey);
+        return;
+      }
+      const current = await readStablePath(monitor.path, monitor.settleMs);
+      const readKey = `present:${metadataSignature(current.metadata)}`;
+      if (readKey !== expectedKey) {
+        this.#scheduleSettle(monitor, readKey);
+        return;
+      }
+
+      const previous = monitor.snapshot;
+      const replaced = identitySignature(previous.metadata) !== identitySignature(current.metadata);
+      if (!replaced && previous.text === current.text) {
+        monitor.snapshot = current;
+        this.#clearPending(monitor);
+        return;
+      }
+
+      monitor.snapshot = current;
+      monitor.revision += 1;
+      this.#clearPending(monitor);
+      this.#emit(monitor, {
+        type: replaced ? "replaced" : "changed",
+        monitorId: monitor.id,
+        path: monitor.path,
+        revision: monitor.revision,
+        previousRevision: monitor.revision - 1,
+        observedAt: new Date().toISOString(),
+        metadata: publicMetadata(current.metadata),
+        delta: computeLineDelta(previous.text, current.text, monitor.contextLines),
+      });
+    } catch (error) {
+      if (error.code === "TARGET_CHANGED_DURING_READ") {
+        void this.#poll(monitor);
+        return;
+      }
+      this.#fail(monitor, error);
+    }
+  }
+
+  #emit(monitor, event) {
+    monitor.lastEventAt = event.observedAt;
+    monitor.events.push(event);
+    if (monitor.events.length > MAX_EVENT_HISTORY) monitor.events.shift();
+    for (const waiter of [...monitor.waiters]) {
+      if (event.revision > waiter.afterRevision) waiter.resolve(eventResult(event));
+    }
+  }
+
+  #fail(monitor, error) {
+    const normalized = translateFileError(error, monitor.path);
+    monitor.error = { code: normalized.code, message: normalized.message, details: normalized.details };
+    this.#stop(monitor, "runtime-failed", "error");
+  }
+
+  #stop(monitor, reason, status, resolveWaiters = true) {
+    clearInterval(monitor.pollTimer);
+    clearTimeout(monitor.settleTimer);
+    monitor.pollTimer = null;
+    monitor.settleTimer = null;
+    monitor.pendingKey = null;
+    monitor.status = status;
+    monitor.reason = reason;
+    if (this.activeByPath.get(monitor.path) === monitor.id) this.activeByPath.delete(monitor.path);
+    if (!resolveWaiters) return;
+    const result = { state: status === "error" ? "error" : "stopped", ...this.#status(monitor) };
+    for (const waiter of [...monitor.waiters]) waiter.resolve(result);
+  }
+}
+
+function toolSuccess(data) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data) }],
+    structuredContent: data,
+  };
+}
+
+function toolFailure(error) {
+  const normalized =
+    error instanceof HoonsooError
+      ? error
+      : new HoonsooError("INTERNAL_ERROR", error?.message ?? String(error));
+  const data = {
+    error: {
+      code: normalized.code,
+      message: normalized.message,
+      ...(normalized.details === undefined ? {} : { details: normalized.details }),
+    },
+  };
+  return {
+    content: [{ type: "text", text: JSON.stringify(data) }],
+    structuredContent: data,
+    isError: true,
+  };
+}
+
+export async function callTool(session, name, args, signal = undefined) {
+  try {
+    let result;
+    switch (name) {
+      case "start_monitor":
+        result = await session.startMonitor(args);
+        break;
+      case "read_snapshot":
+        result = session.readSnapshot(args);
+        break;
+      case "wait_for_change":
+        result = await session.waitForChange(args, signal);
+        break;
+      case "get_status":
+        result = session.getStatus(args);
+        break;
+      case "stop_monitor":
+        result = session.stopMonitor(args);
+        break;
+      default:
+        throw new HoonsooError("TOOL_NOT_FOUND", `Unknown tool: ${name}`);
+    }
+    return toolSuccess(result);
+  } catch (error) {
+    return toolFailure(error);
+  }
+}
+
+function jsonRpcError(id, code, message, data = undefined) {
+  return { jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } };
+}
+
+function jsonRpcResult(id, result) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+export function createMcpServer({ input = process.stdin, output = process.stdout } = {}) {
+  const session = new MonitorSession();
+  const inFlight = new Map();
+  let initialized = false;
+  let closed = false;
+
+  const send = (message) => {
+    if (!closed) output.write(`${JSON.stringify(message)}\n`);
+  };
+
+  const handle = async (message) => {
+    if (Array.isArray(message)) {
+      if (message.length === 0) {
+        send(jsonRpcError(null, -32600, "Invalid Request"));
+        return;
+      }
+      for (const item of message) void handle(item);
+      return;
+    }
+    if (message === null || typeof message !== "object" || message.jsonrpc !== "2.0") {
+      send(jsonRpcError(null, -32600, "Invalid Request"));
+      return;
+    }
+
+    const hasId = Object.prototype.hasOwnProperty.call(message, "id");
+    const id = hasId ? message.id : undefined;
+    const method = message.method;
+    if (typeof method !== "string") {
+      if (hasId) send(jsonRpcError(id, -32600, "Invalid Request"));
+      return;
+    }
+
+    if (method === "notifications/cancelled") {
+      const requestId = message.params?.requestId;
+      inFlight.get(JSON.stringify(requestId))?.abort();
+      return;
+    }
+    if (method === "notifications/initialized") {
+      initialized = true;
+      return;
+    }
+    if (!hasId) return;
+
+    const controller = new AbortController();
+    const requestKey = JSON.stringify(id);
+    inFlight.set(requestKey, controller);
+    try {
+      switch (method) {
+        case "initialize": {
+          const requested = message.params?.protocolVersion;
+          const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+            ? requested
+            : SUPPORTED_PROTOCOL_VERSIONS[0];
+          send(
+            jsonRpcResult(id, {
+              protocolVersion,
+              capabilities: { tools: { listChanged: false } },
+              serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+              instructions:
+                "Hoonsoo only reads explicitly selected UTF-8 regular files. It never writes to the target or workspace.",
+            }),
+          );
+          break;
+        }
+        case "ping":
+          send(jsonRpcResult(id, {}));
+          break;
+        case "tools/list":
+          send(jsonRpcResult(id, { tools: TOOL_DEFINITIONS }));
+          break;
+        case "tools/call": {
+          if (!initialized) {
+            send(jsonRpcError(id, -32002, "Server is not initialized"));
+            break;
+          }
+          const params = assertObject(message.params, "params");
+          const name = requireString(params.name, "name");
+          const result = await callTool(session, name, params.arguments ?? {}, controller.signal);
+          send(jsonRpcResult(id, result));
+          break;
+        }
+        default:
+          send(jsonRpcError(id, -32601, "Method not found"));
+      }
+    } catch (error) {
+      send(jsonRpcError(id, -32602, error.message));
+    } finally {
+      inFlight.delete(requestKey);
+    }
+  };
+
+  const lines = createInterface({ input, crlfDelay: Infinity, terminal: false });
+  lines.on("line", (line) => {
+    if (line.trim().length === 0) return;
+    try {
+      void handle(JSON.parse(line));
+    } catch (error) {
+      send(jsonRpcError(null, -32700, "Parse error", error.message));
+    }
+  });
+  lines.on("close", () => {
+    closed = true;
+    for (const controller of inFlight.values()) controller.abort();
+    session.close();
+  });
+
+  return {
+    session,
+    close() {
+      if (closed) return;
+      lines.close();
+    },
+  };
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) createMcpServer();

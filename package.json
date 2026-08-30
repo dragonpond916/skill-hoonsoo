@@ -1,0 +1,17 @@
+{
+  "name": "skill-hoonsoo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only document monitoring plugin for Codex and Claude Code",
+  "type": "module",
+  "engines": {
+    "node": ">=18.12"
+  },
+  "scripts": {
+    "package:plugin": "node tools/package-plugin.mjs",
+    "check:package": "node tools/package-plugin.mjs --check",
+    "test:runtime": "node --test tests/runtime/*.test.mjs",
+    "test:package": "node --test tests/package/*.test.mjs",
+    "test": "npm run check:package && npm run test:runtime && npm run test:package"
+  }
+}

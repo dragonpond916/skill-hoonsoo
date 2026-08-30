@@ -1,0 +1,34 @@
+{
+  "name": "skill-hoonsoo",
+  "version": "0.1.0",
+  "description": "Read-only live context and grammar review for local documents.",
+  "author": {
+    "name": "dragonpond"
+  },
+  "homepage": "https://github.com/dragonpond916/skill-hoonsoo",
+  "repository": "https://github.com/dragonpond916/skill-hoonsoo",
+  "skills": "./skills/",
+  "mcpServers": {
+    "hoonsoo": {
+      "command": "node",
+      "args": [
+        "scripts/hoonsoo-mcp.mjs"
+      ],
+      "cwd": "."
+    }
+  },
+  "interface": {
+    "displayName": "Hoonsoo",
+    "shortDescription": "Read-only live document review advice.",
+    "longDescription": "Monitors user-selected documents, reviews their changes, and provides context and grammar advice without modifying source files.",
+    "developerName": "dragonpond",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Monitor this document in context mode and advise me as I edit.",
+      "Monitor this document for grammar and style issues as I edit."
+    ]
+  }
+}

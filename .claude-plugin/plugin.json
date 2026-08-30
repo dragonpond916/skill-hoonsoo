@@ -1,0 +1,20 @@
+{
+  "name": "skill-hoonsoo",
+  "displayName": "Hoonsoo",
+  "version": "0.1.0",
+  "description": "Read-only live context and grammar review for local documents.",
+  "author": {
+    "name": "dragonpond",
+    "url": "https://github.com/dragonpond916"
+  },
+  "homepage": "https://github.com/dragonpond916/skill-hoonsoo",
+  "repository": "https://github.com/dragonpond916/skill-hoonsoo",
+  "keywords": [
+    "review",
+    "grammar",
+    "document",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./claude.mcp.json"
+}

@@ -1,0 +1,1741 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoonsoo:schema:manifest:0.1.0",
+  "title": "Hoonsoo Skill Runtime Manifest",
+  "description": "Portable, host-neutral runtime contract for the Hoonsoo advice-only document review skill. This is a Hoonsoo-specific manifest and is intentionally separate from vendor plugin manifests.",
+  "$comment": "Referenced file existence, adapter capability completeness, and other cross-object invariants require package-level semantic validation in addition to JSON Schema validation.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "kind",
+    "metadata",
+    "skill",
+    "runtime",
+    "commands",
+    "lifecycle",
+    "watch",
+    "agents",
+    "pipeline",
+    "reviewProfiles",
+    "output",
+    "safety",
+    "permissions",
+    "hostContract"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "pattern": "^(?:urn:hoonsoo:schema:manifest:0\\.1\\.0|(?:.*\\/)?schemas/hoonsoo\\.manifest\\.schema\\.json)$",
+      "description": "URI or relative path of this JSON Schema."
+    },
+    "schemaVersion": {
+      "const": "0.1.0",
+      "description": "Version of the Hoonsoo manifest contract, independent of the skill package version."
+    },
+    "kind": {
+      "const": "HoonsooSkill",
+      "description": "Discriminator for Hoonsoo runtime manifests."
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "skill": {
+      "$ref": "#/$defs/skill"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "commands": {
+      "$ref": "#/$defs/commands"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/lifecycle"
+    },
+    "watch": {
+      "$ref": "#/$defs/watch"
+    },
+    "agents": {
+      "$ref": "#/$defs/agents"
+    },
+    "pipeline": {
+      "$ref": "#/$defs/pipeline"
+    },
+    "reviewProfiles": {
+      "$ref": "#/$defs/reviewProfiles"
+    },
+    "output": {
+      "$ref": "#/$defs/output"
+    },
+    "safety": {
+      "$ref": "#/$defs/safety"
+    },
+    "permissions": {
+      "$ref": "#/$defs/permissions"
+    },
+    "hostContract": {
+      "$ref": "#/$defs/hostContract"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Namespaced implementation metadata not interpreted by the portable Hoonsoo runtime contract.",
+      "additionalProperties": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\./(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$",
+      "description": "Forward-slash plugin-relative package path beginning with ./ and without parent traversal."
+    },
+    "capabilityId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+$"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "name",
+        "displayName",
+        "version",
+        "description"
+      ],
+      "properties": {
+        "name": {
+          "const": "hoonsoo"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "skill": {
+      "type": "object",
+      "required": [
+        "standard",
+        "path",
+        "frontmatterPolicy",
+        "implicitInvocation"
+      ],
+      "properties": {
+        "standard": {
+          "const": "agentskills.io",
+          "description": "Portable Agent Skills SKILL.md format."
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "frontmatterPolicy": {
+          "const": "portable-core-only",
+          "description": "Keep vendor-only command, hook, shell, and agent fields out of the shared SKILL.md frontmatter."
+        },
+        "implicitInvocation": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "processEntrypoint": {
+      "type": "object",
+      "required": [
+        "command",
+        "args"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?:[A-Za-z0-9._-]+|\\./[A-Za-z0-9._/-]+)$",
+          "description": "Executable name or adapter-resolved package binary."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workingDirectory": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "environment": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Z_][A-Z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "kind",
+        "entrypoint",
+        "protocol",
+        "state"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "supervisor-process",
+            "mcp-server"
+          ]
+        },
+        "entrypoint": {
+          "$ref": "#/$defs/processEntrypoint"
+        },
+        "protocol": {
+          "enum": [
+            "jsonl-stdio",
+            "json-rpc-2.0-stdio",
+            "mcp-stdio"
+          ]
+        },
+        "state": {
+          "type": "object",
+          "required": [
+            "scope",
+            "storage",
+            "retention",
+            "persistDocumentContent"
+          ],
+          "properties": {
+            "scope": {
+              "const": "session"
+            },
+            "storage": {
+              "enum": [
+                "memory",
+                "session-temp"
+              ]
+            },
+            "retention": {
+              "const": "until-session-end"
+            },
+            "persistDocumentContent": {
+              "const": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "supervisor-process"
+            },
+            "protocol": {
+              "enum": [
+                "jsonl-stdio",
+                "json-rpc-2.0-stdio"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "mcp-server"
+            },
+            "protocol": {
+              "const": "mcp-stdio"
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "argument": {
+      "type": "object",
+      "required": [
+        "name",
+        "position",
+        "type",
+        "required",
+        "capture",
+        "description"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*$"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "type": {
+          "enum": [
+            "path",
+            "string"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "capture": {
+          "enum": [
+            "token",
+            "remainder"
+          ]
+        },
+        "default": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "command": {
+      "type": "object",
+      "required": [
+        "invocation",
+        "summary",
+        "reviewProfile",
+        "action",
+        "arguments"
+      ],
+      "properties": {
+        "invocation": {
+          "type": "string",
+          "pattern": "^/hoonsoo:[a-z][a-z0-9-]*$"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "reviewProfile": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*$"
+        },
+        "action": {
+          "const": "start-or-reconfigure-monitor"
+        },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/argument"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fileArgument": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/argument"
+        },
+        {
+          "properties": {
+            "name": {
+              "const": "filePath"
+            },
+            "position": {
+              "const": 0
+            },
+            "type": {
+              "const": "path"
+            },
+            "required": {
+              "const": true
+            },
+            "capture": {
+              "const": "token"
+            }
+          }
+        }
+      ]
+    },
+    "promptArgument": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/argument"
+        },
+        {
+          "required": [
+            "default"
+          ],
+          "properties": {
+            "name": {
+              "const": "prompt"
+            },
+            "position": {
+              "const": 1
+            },
+            "type": {
+              "const": "string"
+            },
+            "required": {
+              "const": false
+            },
+            "capture": {
+              "const": "remainder"
+            },
+            "default": {
+              "const": ""
+            }
+          }
+        }
+      ]
+    },
+    "commandArguments": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/fileArgument"
+        },
+        {
+          "$ref": "#/$defs/promptArgument"
+        }
+      ],
+      "items": {
+        "$ref": "#/$defs/argument"
+      }
+    },
+    "contextCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "invocation": {
+              "const": "/hoonsoo:context"
+            },
+            "reviewProfile": {
+              "const": "context"
+            },
+            "arguments": {
+              "$ref": "#/$defs/commandArguments"
+            }
+          }
+        }
+      ]
+    },
+    "grammarCommand": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "invocation": {
+              "const": "/hoonsoo:grammar"
+            },
+            "reviewProfile": {
+              "const": "grammar"
+            },
+            "arguments": {
+              "$ref": "#/$defs/commandArguments"
+            }
+          }
+        }
+      ]
+    },
+    "commands": {
+      "type": "object",
+      "required": [
+        "context",
+        "grammar"
+      ],
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/contextCommand"
+        },
+        "grammar": {
+          "$ref": "#/$defs/grammarCommand"
+        }
+      },
+      "additionalProperties": false
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": [
+        "scope",
+        "startOnCommand",
+        "stopConditions",
+        "onTargetDeleted",
+        "onTargetReplaced",
+        "monitorUniqueness"
+      ],
+      "properties": {
+        "scope": {
+          "const": "active-session"
+        },
+        "startOnCommand": {
+          "const": true
+        },
+        "stopConditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "user-cancelled",
+              "session-ended",
+              "target-deleted",
+              "runtime-failed"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "onTargetDeleted": {
+          "const": "notify-and-stop"
+        },
+        "onTargetReplaced": {
+          "enum": [
+            "rebaseline-and-review",
+            "notify-and-pause"
+          ]
+        },
+        "monitorUniqueness": {
+          "enum": [
+            "one-per-session-and-target",
+            "one-per-session"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "watch": {
+      "type": "object",
+      "required": [
+        "mode",
+        "pollIntervalMs",
+        "settleMs",
+        "probe",
+        "snapshotRead",
+        "initialSnapshot",
+        "snapshotStorage",
+        "maxSnapshots",
+        "encoding",
+        "symlinkPolicy",
+        "maxFileBytes"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "polling",
+            "native-events-with-poll-fallback"
+          ]
+        },
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 250,
+          "maximum": 60000
+        },
+        "settleMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "Quiet period used to coalesce partial editor writes before snapshotting."
+        },
+        "probe": {
+          "enum": [
+            "metadata-first",
+            "content-hash"
+          ]
+        },
+        "snapshotRead": {
+          "const": "on-change-only",
+          "description": "A deterministic local diff engine may read the new snapshot after a change; the full snapshot is not repeatedly sent to an LLM."
+        },
+        "initialSnapshot": {
+          "const": "full"
+        },
+        "snapshotStorage": {
+          "enum": [
+            "memory",
+            "session-temp"
+          ]
+        },
+        "maxSnapshots": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 10
+        },
+        "encoding": {
+          "enum": [
+            "utf-8",
+            "auto-detect"
+          ]
+        },
+        "symlinkPolicy": {
+          "enum": [
+            "follow-target",
+            "reject"
+          ]
+        },
+        "maxFileBytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "concurrency": {
+      "type": "object",
+      "required": [
+        "mode",
+        "maximum",
+        "overflow"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "singleton",
+            "per-change",
+            "per-batch",
+            "bounded-pool"
+          ]
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "overflow": {
+          "enum": [
+            "queue",
+            "coalesce",
+            "drop-stale"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "singleton"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "maximum": {
+                "const": 1
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "role",
+        "implementation",
+        "responsibility",
+        "concurrency",
+        "inputs",
+        "outputs",
+        "interruptible",
+        "effectPolicy"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "monitor",
+            "diff-checker",
+            "field-checker",
+            "main-reviewer"
+          ]
+        },
+        "implementation": {
+          "enum": [
+            "deterministic-worker",
+            "llm-agent",
+            "host-session-agent"
+          ]
+        },
+        "modelClass": {
+          "enum": [
+            "fast",
+            "balanced",
+            "capable"
+          ],
+          "description": "Vendor-neutral model tier hint, not a model identifier."
+        },
+        "responsibility": {
+          "type": "string",
+          "minLength": 1
+        },
+        "concurrency": {
+          "$ref": "#/$defs/concurrency"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "interruptible": {
+          "type": "boolean"
+        },
+        "effectPolicy": {
+          "const": "read-compute-and-emit-only",
+          "description": "The role may read, compute, and emit advice but may not mutate user files or the user workspace."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "implementation": {
+                "enum": [
+                  "llm-agent",
+                  "host-session-agent"
+                ]
+              }
+            },
+            "required": [
+              "implementation"
+            ]
+          },
+          "then": {
+            "required": [
+              "modelClass"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "monitorAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "monitor"
+            }
+          }
+        }
+      ]
+    },
+    "diffCheckerAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "diff-checker"
+            }
+          }
+        }
+      ]
+    },
+    "fieldCheckerAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "field-checker"
+            }
+          }
+        }
+      ]
+    },
+    "mainReviewerAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "main-reviewer"
+            }
+          }
+        }
+      ]
+    },
+    "agents": {
+      "type": "object",
+      "required": [
+        "monitor",
+        "diffChecker",
+        "fieldChecker",
+        "mainReviewer"
+      ],
+      "properties": {
+        "monitor": {
+          "$ref": "#/$defs/monitorAgent"
+        },
+        "diffChecker": {
+          "$ref": "#/$defs/diffCheckerAgent"
+        },
+        "fieldChecker": {
+          "$ref": "#/$defs/fieldCheckerAgent"
+        },
+        "mainReviewer": {
+          "$ref": "#/$defs/mainReviewerAgent"
+        }
+      },
+      "additionalProperties": false
+    },
+    "delta": {
+      "type": "object",
+      "required": [
+        "algorithm",
+        "localComputation",
+        "initialModelInput",
+        "subsequentModelInput",
+        "contextLines",
+        "aggregation",
+        "maxInitialChunkCharacters",
+        "initialOversizedPolicy",
+        "maxDeltaCharacters",
+        "oversizedDeltaPolicy"
+      ],
+      "properties": {
+        "algorithm": {
+          "enum": [
+            "myers-line",
+            "patience-line",
+            "structural",
+            "implementation-defined"
+          ]
+        },
+        "localComputation": {
+          "const": true,
+          "description": "Diffing happens outside the main LLM so unchanged document text is not repeatedly consumed as model input."
+        },
+        "initialModelInput": {
+          "const": "full-document-once"
+        },
+        "subsequentModelInput": {
+          "const": "delta-with-bounded-context"
+        },
+        "contextLines": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50
+        },
+        "aggregation": {
+          "const": "net-delta-from-last-acknowledged-revision"
+        },
+        "maxInitialChunkCharacters": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "initialOversizedPolicy": {
+          "const": "chunk-by-structure"
+        },
+        "maxDeltaCharacters": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "oversizedDeltaPolicy": {
+          "enum": [
+            "chunk-by-structure",
+            "coalesce-and-summarize-locally",
+            "pause-and-notify"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "batching": {
+      "type": "object",
+      "required": [
+        "coalesceWindowMs",
+        "ordering",
+        "maxQueuedChanges",
+        "overflow"
+      ],
+      "properties": {
+        "coalesceWindowMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "ordering": {
+          "const": "revision-ascending"
+        },
+        "maxQueuedChanges": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "overflow": {
+          "const": "coalesce-to-latest-net-delta"
+        }
+      },
+      "additionalProperties": false
+    },
+    "interruption": {
+      "type": "object",
+      "required": [
+        "trigger",
+        "runtimeReviewAction",
+        "hostGenerationAction",
+        "onUnsupportedHostInterrupt",
+        "discardPartialAdvice",
+        "resumeAfter"
+      ],
+      "properties": {
+        "trigger": {
+          "const": "new-change-during-main-review"
+        },
+        "runtimeReviewAction": {
+          "const": "abort-active-review"
+        },
+        "hostGenerationAction": {
+          "enum": [
+            "required",
+            "capability-gated",
+            "none"
+          ],
+          "description": "Immediate cancellation of the host model is not a portable Agent Skills or Agent Plugins capability."
+        },
+        "onUnsupportedHostInterrupt": {
+          "const": "mark-stale-and-discard"
+        },
+        "discardPartialAdvice": {
+          "const": true
+        },
+        "resumeAfter": {
+          "const": "aggregated-delta-ready"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pipeline": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "routingPolicy",
+        "delta",
+        "batching",
+        "interruption",
+        "cooldownMs",
+        "staleResultPolicy",
+        "acknowledgeRevisionAfter"
+      ],
+      "properties": {
+        "sequence": {
+          "const": [
+            "monitor",
+            "diffChecker",
+            "fieldChecker",
+            "mainReviewer"
+          ]
+        },
+        "routingPolicy": {
+          "type": "object",
+          "required": [
+            "context",
+            "grammar"
+          ],
+          "properties": {
+            "context": {
+              "const": "professional-domain-classification"
+            },
+            "grammar": {
+              "const": "file-format-and-natural-language-only"
+            }
+          },
+          "additionalProperties": false
+        },
+        "delta": {
+          "$ref": "#/$defs/delta"
+        },
+        "batching": {
+          "$ref": "#/$defs/batching"
+        },
+        "interruption": {
+          "$ref": "#/$defs/interruption"
+        },
+        "cooldownMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "staleResultPolicy": {
+          "const": "discard-by-generation"
+        },
+        "acknowledgeRevisionAfter": {
+          "const": "advice-emitted-or-buffered"
+        }
+      },
+      "additionalProperties": false
+    },
+    "domainClassification": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "multiLabel",
+        "taxonomy",
+        "fallback"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "multiLabel": {
+          "type": "boolean"
+        },
+        "taxonomy": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "uniqueItems": true
+        },
+        "fallback": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "contextProfile": {
+      "type": "object",
+      "required": [
+        "semanticAnalysis",
+        "userPromptPolicy",
+        "domainClassification",
+        "recommendationFocus"
+      ],
+      "properties": {
+        "semanticAnalysis": {
+          "const": true
+        },
+        "userPromptPolicy": {
+          "const": "merge-as-additional-constraints"
+        },
+        "domainClassification": {
+          "$ref": "#/$defs/domainClassification"
+        },
+        "recommendationFocus": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "formatValidator": {
+      "type": "object",
+      "required": [
+        "id",
+        "extensions",
+        "checks"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "extensions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[A-Za-z0-9]+$"
+          },
+          "uniqueItems": true
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "uniqueItems": true
+        },
+        "compileWhenProjectContextAvailable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "syntaxValidation": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "priority",
+        "validators",
+        "toolUnavailablePolicy",
+        "sideEffectIsolation"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "priority": {
+          "const": "first"
+        },
+        "validators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/formatValidator"
+          }
+        },
+        "toolUnavailablePolicy": {
+          "const": "report-limitation-and-continue"
+        },
+        "sideEffectIsolation": {
+          "const": "temporary-workspace-only"
+        }
+      },
+      "additionalProperties": false
+    },
+    "naturalLanguageValidation": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "languageDetection",
+        "scope",
+        "checks",
+        "thoroughness"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "languageDetection": {
+          "const": "automatic"
+        },
+        "scope": {
+          "enum": [
+            "all-prose",
+            "human-language-segments"
+          ]
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "grammar",
+              "spelling",
+              "punctuation",
+              "style",
+              "terminology-consistency"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "thoroughness": {
+          "const": "exhaustive"
+        }
+      },
+      "additionalProperties": false
+    },
+    "grammarProfile": {
+      "type": "object",
+      "required": [
+        "semanticAnalysis",
+        "userPromptPolicy",
+        "validationOrder",
+        "syntaxValidation",
+        "naturalLanguageValidation"
+      ],
+      "properties": {
+        "semanticAnalysis": {
+          "const": false
+        },
+        "userPromptPolicy": {
+          "const": "apply-only-to-grammar-and-syntax-scope"
+        },
+        "validationOrder": {
+          "const": [
+            "file-syntax",
+            "natural-language-grammar",
+            "spelling",
+            "style"
+          ]
+        },
+        "syntaxValidation": {
+          "$ref": "#/$defs/syntaxValidation"
+        },
+        "naturalLanguageValidation": {
+          "$ref": "#/$defs/naturalLanguageValidation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewProfiles": {
+      "type": "object",
+      "required": [
+        "context",
+        "grammar"
+      ],
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/contextProfile"
+        },
+        "grammar": {
+          "$ref": "#/$defs/grammarProfile"
+        }
+      },
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "required": [
+        "destination",
+        "timing",
+        "format",
+        "updateStrategy",
+        "unsupportedPushFallback"
+      ],
+      "properties": {
+        "destination": {
+          "const": "active-session"
+        },
+        "timing": {
+          "const": "incremental"
+        },
+        "format": {
+          "enum": [
+            "markdown",
+            "structured-json"
+          ]
+        },
+        "updateStrategy": {
+          "const": "append-update-or-invalidate-by-anchor"
+        },
+        "unsupportedPushFallback": {
+          "const": "buffer-until-next-host-turn"
+        }
+      },
+      "additionalProperties": false
+    },
+    "mutation": {
+      "type": "object",
+      "required": [
+        "targetFile",
+        "fullDocumentRewrite",
+        "patches"
+      ],
+      "properties": {
+        "targetFile": {
+          "const": "forbidden"
+        },
+        "fullDocumentRewrite": {
+          "const": "forbidden"
+        },
+        "patches": {
+          "const": "suggestion-only"
+        }
+      },
+      "additionalProperties": false
+    },
+    "adviceContract": {
+      "type": "object",
+      "required": [
+        "requiredFields",
+        "severityOrder",
+        "includeLocation",
+        "includeRationale",
+        "includeSuggestedAction",
+        "maxItemsPerCycle",
+        "overflowPolicy"
+      ],
+      "properties": {
+        "requiredFields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "revision",
+              "anchor",
+              "category",
+              "severity",
+              "message",
+              "rationale",
+              "suggestedAction",
+              "confidence"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "severityOrder": {
+          "const": [
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "note"
+          ]
+        },
+        "includeLocation": {
+          "const": true
+        },
+        "includeRationale": {
+          "const": true
+        },
+        "includeSuggestedAction": {
+          "const": true
+        },
+        "maxItemsPerCycle": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "overflowPolicy": {
+          "const": "continue-in-next-batch"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "type": "object",
+      "required": [
+        "mode",
+        "delivery",
+        "mutation",
+        "advice"
+      ],
+      "properties": {
+        "mode": {
+          "const": "advice-only"
+        },
+        "delivery": {
+          "$ref": "#/$defs/delivery"
+        },
+        "mutation": {
+          "$ref": "#/$defs/mutation"
+        },
+        "advice": {
+          "$ref": "#/$defs/adviceContract"
+        }
+      },
+      "additionalProperties": false
+    },
+    "safety": {
+      "type": "object",
+      "required": [
+        "policy",
+        "scope",
+        "userFileMutation",
+        "workspaceMutation",
+        "targetOpenMode",
+        "writeCapabilities",
+        "editTools",
+        "patchApplication",
+        "autoFix",
+        "exceptions",
+        "runtimeTempWrites",
+        "onViolation"
+      ],
+      "properties": {
+        "policy": {
+          "const": "advice-only"
+        },
+        "scope": {
+          "const": "all-modes-agents-runtimes-and-adapters"
+        },
+        "userFileMutation": {
+          "const": "forbidden"
+        },
+        "workspaceMutation": {
+          "const": "forbidden"
+        },
+        "targetOpenMode": {
+          "const": "read-only"
+        },
+        "writeCapabilities": {
+          "const": "not-granted"
+        },
+        "editTools": {
+          "const": "excluded"
+        },
+        "patchApplication": {
+          "const": "forbidden"
+        },
+        "autoFix": {
+          "const": "forbidden"
+        },
+        "exceptions": {
+          "const": "none"
+        },
+        "runtimeTempWrites": {
+          "const": "isolated-outside-user-workspace-only",
+          "description": "Only disposable runtime/compiler artifacts outside the user's workspace are permitted; no user file may be changed."
+        },
+        "onViolation": {
+          "const": "abort-review-and-notify"
+        }
+      },
+      "additionalProperties": false
+    },
+    "permissions": {
+      "type": "object",
+      "required": [
+        "filesystem",
+        "process",
+        "network",
+        "session",
+        "dataHandling"
+      ],
+      "properties": {
+        "filesystem": {
+          "type": "object",
+          "required": [
+            "readTarget",
+            "watchTarget",
+            "writeTarget",
+            "writeWorkspace",
+            "runtimeTempWrite"
+          ],
+          "properties": {
+            "readTarget": {
+              "const": true
+            },
+            "watchTarget": {
+              "const": true
+            },
+            "writeTarget": {
+              "const": false
+            },
+            "writeWorkspace": {
+              "const": false
+            },
+            "runtimeTempWrite": {
+              "const": "isolated-outside-user-workspace-only"
+            }
+          },
+          "additionalProperties": false
+        },
+        "process": {
+          "type": "object",
+          "required": [
+            "spawn",
+            "shell",
+            "sideEffectPolicy"
+          ],
+          "properties": {
+            "spawn": {
+              "enum": [
+                "required",
+                "optional",
+                "none"
+              ]
+            },
+            "shell": {
+              "const": false
+            },
+            "sideEffectPolicy": {
+              "const": "read-only-user-workspace"
+            }
+          },
+          "additionalProperties": false
+        },
+        "network": {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "none",
+                "optional",
+                "required"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "session": {
+          "type": "object",
+          "required": [
+            "emitAdvice",
+            "interruptHostGeneration"
+          ],
+          "properties": {
+            "emitAdvice": {
+              "enum": [
+                "required",
+                "preferred"
+              ]
+            },
+            "interruptHostGeneration": {
+              "enum": [
+                "required",
+                "preferred",
+                "none"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "dataHandling": {
+          "type": "object",
+          "required": [
+            "initialFullDocumentToModel",
+            "subsequentFullDocumentToModel",
+            "snapshotsRemainLocal",
+            "retention"
+          ],
+          "properties": {
+            "initialFullDocumentToModel": {
+              "const": true
+            },
+            "subsequentFullDocumentToModel": {
+              "const": false,
+              "description": "Subsequent model input contains the delta plus bounded context, never another full-document resend."
+            },
+            "snapshotsRemainLocal": {
+              "const": true
+            },
+            "retention": {
+              "const": "session"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "capability": {
+      "type": "object",
+      "required": [
+        "requirement"
+      ],
+      "properties": {
+        "requirement": {
+          "enum": [
+            "required",
+            "preferred",
+            "optional"
+          ]
+        },
+        "fallback": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "adapterCapability": {
+      "type": "object",
+      "required": [
+        "support"
+      ],
+      "properties": {
+        "support": {
+          "enum": [
+            "native",
+            "bridge",
+            "degraded",
+            "unsupported",
+            "unknown"
+          ]
+        },
+        "mechanism": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fallback": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "adapter": {
+      "type": "object",
+      "required": [
+        "status",
+        "descriptor",
+        "capabilities"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "planned",
+            "experimental",
+            "supported"
+          ]
+        },
+        "descriptor": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "capabilities": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/capabilityId"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/adapterCapability"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Validation evidence required before an adapter may claim supported status."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "supported"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "evidence"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "hostContract": {
+      "type": "object",
+      "required": [
+        "packaging",
+        "compatibilityStatement",
+        "capabilities",
+        "adapters"
+      ],
+      "properties": {
+        "packaging": {
+          "type": "object",
+          "required": [
+            "pluginStandard",
+            "pluginSchema",
+            "skillStandard"
+          ],
+          "properties": {
+            "pluginStandard": {
+              "const": "agent-plugins/1.0.0"
+            },
+            "pluginSchema": {
+              "const": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+            },
+            "skillStandard": {
+              "const": "agentskills.io"
+            }
+          },
+          "additionalProperties": false
+        },
+        "compatibilityStatement": {
+          "const": "portable-packaging-with-capability-gated-runtime-behavior",
+          "description": "Packaging portability does not imply identical real-time push or host-generation interruption on every client."
+        },
+        "capabilities": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/capabilityId"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "adapters": {
+          "type": "object",
+          "required": [
+            "claude-code",
+            "gemini-cli",
+            "codex"
+          ],
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "properties": {
+            "claude-code": {
+              "$ref": "#/$defs/adapter"
+            },
+            "gemini-cli": {
+              "$ref": "#/$defs/adapter"
+            },
+            "codex": {
+              "$ref": "#/$defs/adapter"
+            }
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/adapter"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

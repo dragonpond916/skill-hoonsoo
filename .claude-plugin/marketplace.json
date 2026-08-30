@@ -1,0 +1,14 @@
+{
+  "name": "skill-hoonsoo",
+  "owner": {
+    "name": "dragonpond",
+    "url": "https://github.com/dragonpond916"
+  },
+  "plugins": [
+    {
+      "name": "skill-hoonsoo",
+      "source": "./plugins/skill-hoonsoo",
+      "description": "Read-only live context and grammar review for local documents"
+    }
+  ]
+}
