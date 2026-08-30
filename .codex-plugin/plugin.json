@@ -1,6 +1,6 @@
 {
   "name": "skill-hoonsoo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-only live context and grammar review for local documents.",
   "author": {
     "name": "dragonpond"

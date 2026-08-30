@@ -3,12 +3,16 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  IDLE_WARNING_MESSAGE,
   MAX_DELTA_CHARACTERS,
   MAX_FILE_BYTES,
   MonitorSession,
   computeLineDelta,
+  computeMeaningfulLineDelta,
+  normalizeMeaningfulText,
   normalizeTargetPath,
 } from "../../scripts/hoonsoo-mcp.mjs";
 
@@ -19,6 +23,20 @@ async function temporaryDirectory() {
   const directory = await mkdtemp(path.join(tmpdir(), "hoonsoo-runtime-test-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+async function withDeadline(promise, milliseconds = 1_000) {
+  const controller = new AbortController();
+  try {
+    return await Promise.race([
+      promise,
+      delay(milliseconds, undefined, { signal: controller.signal }).then(() => {
+        throw new Error(`Timed out after ${milliseconds} ms`);
+      }),
+    ]);
+  } finally {
+    controller.abort();
+  }
 }
 
 after(async () => {
@@ -50,6 +68,17 @@ test("computes a bounded line delta with surrounding context", () => {
       ["context", "third"],
     ],
   );
+});
+
+test("normalizes whitespace-only changes out of meaningful comparison and deltas", () => {
+  const previous = "alpha beta\ngamma";
+  const reformatted = "\talpha   beta\n\n  gamma\n";
+
+  assert.equal(normalizeMeaningfulText(previous), normalizeMeaningfulText(reformatted));
+  const delta = computeMeaningfulLineDelta(previous, reformatted, 2);
+  assert.equal(delta.additions, 0);
+  assert.equal(delta.deletions, 0);
+  assert.deepEqual(delta.hunks, []);
 });
 
 test("uses bounded fallbacks and caps serialized delta payloads", () => {
@@ -185,6 +214,213 @@ test("does not advance the revision for a metadata-only write", async () => {
   assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
 });
 
+test("ignores whitespace-only writes and keeps the revision snapshot stable", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  const baseline = "alpha beta\ngamma";
+  await writeFile(target, baseline, "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 20 });
+
+  await writeFile(target, "\talpha   beta\n\n gamma\n", "utf8");
+  const result = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 250,
+  });
+
+  assert.equal(result.state, "timeout");
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
+  assert.equal(session.readSnapshot({ monitorId: started.monitorId }).content, baseline);
+});
+
+test("coalesces repeated meaningful writes until the quiet window elapses", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "version zero", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 120 });
+
+  await writeFile(target, "version one", "utf8");
+  await delay(70);
+  await writeFile(target, "version two", "utf8");
+  await delay(80);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
+
+  const result = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 500,
+  });
+  assert.equal(result.state, "changed");
+  assert.equal(result.event.revision, 1);
+  assert.equal(session.readSnapshot({ monitorId: started.monitorId }).content, "version two");
+});
+
+test("returns the latest net delta from the last handled analysis revision", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "alpha", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 15 });
+
+  await writeFile(target, "bravo", "utf8");
+  const first = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 500,
+  });
+  assert.equal(first.event.revision, 1);
+
+  await writeFile(target, "charlie", "utf8");
+  await delay(100);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 2);
+
+  const accumulated = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 0,
+  });
+  assert.equal(accumulated.event.revision, 2);
+  assert.equal(accumulated.event.previousRevision, 0);
+  assert.equal(accumulated.event.fromRevision, 0);
+  assert.equal(accumulated.event.delta.additions, 1);
+  assert.equal(accumulated.event.delta.deletions, 1);
+  assert.ok(accumulated.event.changedRanges.length > 0);
+  assert.equal("lines" in accumulated.event.delta.hunks[0], false);
+
+  const acknowledged = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 2,
+    timeoutMs: 0,
+  });
+  assert.equal(acknowledged.state, "timeout");
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).analysisBaselineRevision, 2);
+
+  await writeFile(target, "delta", "utf8");
+  const next = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 2,
+    timeoutMs: 500,
+  });
+  assert.equal(next.event.previousRevision, 2);
+  assert.equal(next.event.fromRevision, 2);
+  assert.equal(next.event.delta.additions, 1);
+  assert.equal(next.event.delta.deletions, 1);
+});
+
+test("does not redeliver an older revision while a newer meaningful change is settling", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "zero", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 100 });
+
+  await writeFile(target, "one", "utf8");
+  const first = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 500,
+  });
+  assert.equal(first.event.revision, 1);
+
+  await writeFile(target, "two", "utf8");
+  await delay(40);
+  assert.equal(
+    session.getStatus({ monitorId: started.monitorId }).pendingMeaningfulChange,
+    true,
+  );
+  const latest = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 500,
+  });
+  assert.equal(latest.event.revision, 2);
+  assert.equal(latest.event.previousRevision, 0);
+});
+
+test("emits one idle warning and automatically stops at the idle deadline", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "content", "utf8");
+  const session = new MonitorSession({ idleWarningMs: 60, idleStopMs: 110 });
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
+
+  const warning = await withDeadline(
+    session.waitForChange({
+      monitorId: started.monitorId,
+      afterRevision: 0,
+    }),
+  );
+  assert.equal(warning.state, "idle-warning");
+  assert.equal(warning.message, IDLE_WARNING_MESSAGE);
+  assert.equal(warning.revision, 0);
+
+  const stopped = await withDeadline(
+    session.waitForChange({
+      monitorId: started.monitorId,
+      afterRevision: 0,
+    }),
+  );
+  assert.equal(stopped.state, "idle-stopped");
+  assert.equal(stopped.reason, "idle-timeout");
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).status, "stopped");
+});
+
+test("a meaningful change after the idle warning resets the idle lifecycle", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "before", "utf8");
+  const session = new MonitorSession({ idleWarningMs: 70, idleStopMs: 130 });
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
+
+  const warning = await withDeadline(
+    session.waitForChange({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+  assert.equal(warning.state, "idle-warning");
+  await writeFile(target, "after", "utf8");
+  const changed = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 500,
+  });
+  assert.equal(changed.state, "changed");
+
+  const newWarning = await session.waitForChange({
+    monitorId: started.monitorId,
+    afterRevision: changed.event.revision,
+    timeoutMs: 500,
+  });
+  assert.equal(newWarning.state, "idle-warning");
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).status, "active");
+});
+
+test("whitespace-only writes do not reset the idle clock", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "alpha beta", "utf8");
+  const session = new MonitorSession({ idleWarningMs: 100, idleStopMs: 190 });
+  sessions.push(session);
+  const startedAt = Date.now();
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
+
+  await delay(55);
+  await writeFile(target, "alpha\t beta\n", "utf8");
+  const warning = await withDeadline(
+    session.waitForChange({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+
+  assert.equal(warning.state, "idle-warning");
+  assert.ok(Date.now() - startedAt < 145, "whitespace-only activity unexpectedly reset idle time");
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
+});
+
 test("distinguishes atomic replacement from an in-place change", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
@@ -259,7 +495,7 @@ test("stopping resolves pending waits and future revisions are rejected", async 
   assert.equal(result.reason, "user-stopped");
 });
 
-test("marks pruned event history as requiring a snapshot rebaseline", async () => {
+test("coalesces pruned event history to the latest revision and requires rebaseline", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "content", "utf8");
@@ -281,5 +517,5 @@ test("marks pruned event history as requiring a snapshot rebaseline", async () =
   });
   assert.equal(result.historyTruncated, true);
   assert.equal(result.rebaselineRequired, true);
-  assert.equal(result.event.revision, 7);
+  assert.equal(result.event.revision, 70);
 });

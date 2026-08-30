@@ -86,6 +86,7 @@ test("package contains only the install-time files", async () => {
   assert.deepEqual(await listFiles(packageDirectory), [
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
+    "agents/hoonsoo-advisor.md",
     "claude.mcp.json",
     "scripts/hoonsoo-mcp.mjs",
     "skills/hoonsoo/SKILL.md",

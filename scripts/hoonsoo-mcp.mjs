@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -8,13 +9,19 @@ import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 
 export const MAX_FILE_BYTES = 5 * 1024 * 1024;
-export const MAX_WAIT_MS = 50_000;
+export const MAX_WAIT_MS = 300_000;
 export const DEFAULT_SNAPSHOT_CHARACTERS = 32_000;
 export const MAX_SNAPSHOT_CHARACTERS = 65_536;
 export const MAX_DELTA_CHARACTERS = 24_000;
+export const DEFAULT_IDLE_WARNING_MS = 60_000;
+export const DEFAULT_IDLE_STOP_MS = 90_000;
+export const IDLE_WARNING_MESSAGE =
+  "1분 간, 작업이 감지되지 않습니다. 추가 30초 대기 후, 훈수모드가 정지됩니다.\n" +
+  "추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.";
 
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
-const DEFAULT_SETTLE_MS = 250;
+const DEFAULT_SETTLE_MS = 3_000;
+const READ_RETRY_DELAY_MS = 25;
 const DEFAULT_CONTEXT_LINES = 5;
 const MAX_EVENT_HISTORY = 64;
 const MAX_FINE_DIFF_LINES = 100_000;
@@ -25,7 +32,7 @@ const MAX_DELTA_TEXT_CHARACTERS = 12_000;
 const READ_CHUNK_BYTES = 64 * 1024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const SERVER_NAME = "hoonsoo";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const TOOL_DEFINITIONS = [
@@ -40,7 +47,7 @@ const TOOL_DEFINITIONS = [
       properties: {
         path: { type: "string", description: "Absolute path to the regular file." },
         pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 2_000 },
-        settleMs: { type: "integer", minimum: 0, maximum: 10_000, default: 250 },
+        settleMs: { type: "integer", minimum: 0, maximum: 10_000, default: 3_000 },
         contextLines: { type: "integer", minimum: 0, maximum: 50, default: 5 },
       },
     },
@@ -82,7 +89,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "wait_for_change",
     description:
-      "Wait for the next changed, replaced, or deleted event after a revision. Waiting is capped at 50 seconds and delta payloads are bounded.",
+      "Wait locally until a meaningful content change, the 60-second idle warning, the 90-second idle stop, cancellation, or an optional timeout. Omit timeoutMs to avoid periodic model wake-ups.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -90,7 +97,12 @@ const TOOL_DEFINITIONS = [
       properties: {
         monitorId: { type: "string" },
         afterRevision: { type: "integer", minimum: 0, default: 0 },
-        timeoutMs: { type: "integer", minimum: 0, maximum: MAX_WAIT_MS, default: MAX_WAIT_MS },
+        timeoutMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_WAIT_MS,
+          description: "Optional diagnostic timeout. Omit during normal monitoring.",
+        },
       },
     },
     annotations: {
@@ -328,6 +340,14 @@ function countLines(text) {
     if (text.charCodeAt(index) === 10) count += 1;
   }
   return count;
+}
+
+export function normalizeMeaningfulText(text) {
+  return text.replace(/\s/gu, "");
+}
+
+function semanticHash(text) {
+  return createHash("sha256").update(normalizeMeaningfulText(text), "utf8").digest("hex");
 }
 
 function operation(type, oldLine, newLine, text) {
@@ -650,6 +670,64 @@ export function computeLineDelta(previousText, currentText, contextLines = DEFAU
   });
 }
 
+export function computeMeaningfulLineDelta(
+  previousText,
+  currentText,
+  contextLines = DEFAULT_CONTEXT_LINES,
+) {
+  if (semanticHash(previousText) === semanticHash(currentText)) {
+    return computeLineDelta(previousText, previousText, contextLines);
+  }
+
+  const delta = computeLineDelta(previousText, currentText, contextLines);
+  const hunks = delta.hunks.filter((hunk) => {
+    const deleted = hunk.lines
+      .filter((line) => line.type === "delete")
+      .map((line) => line.text)
+      .join("\n");
+    const added = hunk.lines
+      .filter((line) => line.type === "add")
+      .map((line) => line.text)
+      .join("\n");
+    return normalizeMeaningfulText(deleted) !== normalizeMeaningfulText(added);
+  });
+  const retainedLines = hunks.flatMap((hunk) => hunk.lines);
+  return {
+    ...delta,
+    hunks,
+    additions: retainedLines.filter((line) => line.type === "add").length,
+    deletions: retainedLines.filter((line) => line.type === "delete").length,
+    includedLineOperations: retainedLines.length,
+  };
+}
+
+function changedRanges(delta) {
+  return delta.hunks.map((hunk) => ({
+    startLine: hunk.newStart,
+    endLine: Math.max(hunk.newStart, hunk.newStart + Math.max(0, hunk.newCount - 1)),
+  }));
+}
+
+function deltaReference(delta) {
+  return {
+    algorithm: delta.algorithm,
+    oldLineCount: delta.oldLineCount,
+    newLineCount: delta.newLineCount,
+    additions: delta.additions,
+    deletions: delta.deletions,
+    contextLines: delta.contextLines,
+    truncated: delta.truncated,
+    truncationReason: delta.truncationReason,
+    includedLineOperations: delta.includedLineOperations,
+    hunks: delta.hunks.map(({ oldStart, oldCount, newStart, newCount }) => ({
+      oldStart,
+      oldCount,
+      newStart,
+      newCount,
+    })),
+  };
+}
+
 function pageText(text, offset, maxCharacters) {
   if (offset > text.length) {
     throw new HoonsooError(
@@ -676,17 +754,30 @@ function pageText(text, offset, maxCharacters) {
   };
 }
 
-function eventResult(event, historyTruncated = false) {
-  return {
-    state: "changed",
-    historyTruncated,
-    rebaselineRequired: historyTruncated,
-    event,
-  };
-}
-
 export class MonitorSession {
-  constructor() {
+  constructor(options = {}) {
+    const args = assertObject(options, "MonitorSession options");
+    this.idleWarningMs = integerOption(
+      args.idleWarningMs,
+      "idleWarningMs",
+      DEFAULT_IDLE_WARNING_MS,
+      1,
+      24 * 60 * 60 * 1_000,
+    );
+    this.idleStopMs = integerOption(
+      args.idleStopMs,
+      "idleStopMs",
+      DEFAULT_IDLE_STOP_MS,
+      2,
+      24 * 60 * 60 * 1_000,
+    );
+    if (this.idleStopMs <= this.idleWarningMs) {
+      throw new HoonsooError("INVALID_ARGUMENT", "idleStopMs must be greater than idleWarningMs.");
+    }
+    this.now = args.now ?? Date.now;
+    if (typeof this.now !== "function") {
+      throw new HoonsooError("INVALID_ARGUMENT", "now must be a function.");
+    }
     this.monitors = new Map();
     this.activeByPath = new Map();
     this.nextMonitorNumber = 1;
@@ -722,7 +813,9 @@ export class MonitorSession {
       return { ...this.#status(active), reused: true };
     }
 
-    const snapshot = await readStablePath(targetPath, settleMs);
+    const snapshot = await readStablePath(targetPath, READ_RETRY_DELAY_MS);
+    const snapshotHash = semanticHash(snapshot.text);
+    const startedAtMs = this.now();
     const monitor = {
       id: `monitor-${this.nextMonitorNumber++}`,
       path: targetPath,
@@ -730,22 +823,36 @@ export class MonitorSession {
       reason: null,
       error: null,
       revision: 0,
-      snapshot,
+      observedSnapshot: snapshot,
+      observedSemanticHash: snapshotHash,
+      revisionSnapshot: snapshot,
+      revisionSemanticHash: snapshotHash,
+      analysisBaselineRevision: 0,
+      analysisBaselineSnapshot: snapshot,
+      revisionSnapshots: new Map([[0, snapshot]]),
       pollIntervalMs,
       settleMs,
       contextLines,
-      startedAt: new Date().toISOString(),
+      startedAt: new Date(startedAtMs).toISOString(),
       lastEventAt: null,
+      lastMeaningfulActivityAtMs: startedAtMs,
+      idleWarningIssued: false,
+      idleWarningPending: false,
+      idleWarningDelivered: false,
       events: [],
       waiters: new Set(),
       pollTimer: null,
       settleTimer: null,
+      idleTimer: null,
       pendingKey: null,
+      pendingMeaningfulChange: false,
       polling: false,
+      settling: false,
     };
     this.monitors.set(monitor.id, monitor);
     this.activeByPath.set(targetPath, monitor.id);
     this.#restartPollTimer(monitor);
+    this.#scheduleIdleTimer(monitor);
     return { ...this.#status(monitor), reused: false };
   }
 
@@ -765,8 +872,9 @@ export class MonitorSession {
       path: monitor.path,
       revision: monitor.revision,
       status: monitor.status,
-      metadata: publicMetadata(monitor.snapshot.metadata),
-      ...pageText(monitor.snapshot.text, offset, maxCharacters),
+      semanticHash: monitor.revisionSemanticHash,
+      metadata: publicMetadata(monitor.revisionSnapshot.metadata),
+      ...pageText(monitor.revisionSnapshot.text, offset, maxCharacters),
     };
   }
 
@@ -780,24 +888,40 @@ export class MonitorSession {
       0,
       Number.MAX_SAFE_INTEGER,
     );
-    const timeoutMs = integerOption(args.timeoutMs, "timeoutMs", MAX_WAIT_MS, 0, MAX_WAIT_MS);
+    const timeoutMs =
+      args.timeoutMs === undefined
+        ? null
+        : integerOption(args.timeoutMs, "timeoutMs", 0, 0, MAX_WAIT_MS);
     if (afterRevision > monitor.revision) {
       throw new HoonsooError(
         "REVISION_AHEAD",
         `afterRevision ${afterRevision} is ahead of current revision ${monitor.revision}. Re-read status or snapshot before waiting.`,
       );
     }
-    const event = monitor.events.find((candidate) => candidate.revision > afterRevision);
-    if (event) {
-      return Promise.resolve(
-        eventResult(event, monitor.events[0]?.revision > afterRevision + 1),
-      );
+    this.#acknowledgeHandledRevision(monitor, afterRevision);
+    let event;
+    for (let index = monitor.events.length - 1; index >= 0; index -= 1) {
+      if (monitor.events[index].revision > afterRevision) {
+        event = monitor.events[index];
+        break;
+      }
+    }
+    if (event && !monitor.pendingMeaningfulChange) {
+      return Promise.resolve(this.#eventResult(monitor, event, afterRevision));
     }
     if (monitor.status === "error") {
       return Promise.resolve({ state: "error", ...this.#status(monitor) });
     }
     if (monitor.status !== "active") {
-      return Promise.resolve({ state: "stopped", ...this.#status(monitor) });
+      return Promise.resolve({
+        state: monitor.reason === "idle-timeout" ? "idle-stopped" : "stopped",
+        ...this.#status(monitor),
+      });
+    }
+    if (monitor.idleWarningPending && !monitor.idleWarningDelivered) {
+      monitor.idleWarningPending = false;
+      monitor.idleWarningDelivered = true;
+      return Promise.resolve(this.#idleWarningResult(monitor));
     }
     if (timeoutMs === 0) {
       return Promise.resolve({
@@ -812,7 +936,7 @@ export class MonitorSession {
       const waiter = {
         afterRevision,
         resolve: (result) => {
-          clearTimeout(waiter.timer);
+          if (waiter.timer) clearTimeout(waiter.timer);
           signal?.removeEventListener("abort", waiter.abort);
           monitor.waiters.delete(waiter);
           resolve(result);
@@ -827,14 +951,16 @@ export class MonitorSession {
         },
         timer: null,
       };
-      waiter.timer = setTimeout(() => {
-        waiter.resolve({
-          state: "timeout",
-          monitorId: monitor.id,
-          revision: monitor.revision,
-          status: monitor.status,
-        });
-      }, timeoutMs);
+      if (timeoutMs !== null) {
+        waiter.timer = setTimeout(() => {
+          waiter.resolve({
+            state: "timeout",
+            monitorId: monitor.id,
+            revision: monitor.revision,
+            status: monitor.status,
+          });
+        }, timeoutMs);
+      }
       monitor.waiters.add(waiter);
       signal?.addEventListener("abort", waiter.abort, { once: true });
       if (signal?.aborted) waiter.abort();
@@ -877,12 +1003,61 @@ export class MonitorSession {
       reason: monitor.reason,
       error: monitor.error,
       revision: monitor.revision,
-      metadata: publicMetadata(monitor.snapshot.metadata),
+      semanticHash: monitor.revisionSemanticHash,
+      metadata: publicMetadata(monitor.revisionSnapshot.metadata),
+      observedMetadata: publicMetadata(monitor.observedSnapshot.metadata),
       pollIntervalMs: monitor.pollIntervalMs,
       settleMs: monitor.settleMs,
       contextLines: monitor.contextLines,
       startedAt: monitor.startedAt,
       lastEventAt: monitor.lastEventAt,
+      analysisBaselineRevision: monitor.analysisBaselineRevision,
+      pendingMeaningfulChange: monitor.pendingMeaningfulChange,
+      idleWarningIssued: monitor.idleWarningIssued,
+      idleForMs: Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs),
+    };
+  }
+
+  #acknowledgeHandledRevision(monitor, revision) {
+    if (revision <= monitor.analysisBaselineRevision) return;
+    const snapshot =
+      monitor.revisionSnapshots.get(revision) ??
+      (revision === monitor.revision ? monitor.revisionSnapshot : undefined);
+    if (!snapshot) return;
+    monitor.analysisBaselineRevision = revision;
+    monitor.analysisBaselineSnapshot = snapshot;
+  }
+
+  #eventResult(monitor, event, afterRevision) {
+    const snapshot =
+      monitor.revisionSnapshots.get(event.revision) ??
+      (event.revision === monitor.revision ? monitor.revisionSnapshot : undefined);
+    if (!snapshot) {
+      return {
+        state: "changed",
+        historyTruncated: true,
+        rebaselineRequired: true,
+        event: { ...event, delta: null, changedRanges: [] },
+      };
+    }
+    const delta = computeMeaningfulLineDelta(
+      monitor.analysisBaselineSnapshot.text,
+      snapshot.text,
+      monitor.contextLines,
+    );
+    const historyTruncated = monitor.events[0]?.revision > afterRevision + 1;
+    return {
+      state: "changed",
+      historyTruncated,
+      rebaselineRequired: historyTruncated || delta.truncated,
+      event: {
+        ...event,
+        previousRevision: monitor.analysisBaselineRevision,
+        fromRevision: monitor.analysisBaselineRevision,
+        semanticHash: semanticHash(snapshot.text),
+        changedRanges: changedRanges(delta),
+        delta: deltaReference(delta),
+      },
     };
   }
 
@@ -895,18 +1070,36 @@ export class MonitorSession {
   }
 
   async #poll(monitor) {
-    if (monitor.status !== "active" || monitor.polling) return;
+    if (monitor.status !== "active" || monitor.polling || monitor.settling) return;
     monitor.polling = true;
     try {
       const metadata = await probeMetadata(monitor.path);
-      if (metadataSignature(metadata) === metadataSignature(monitor.snapshot.metadata)) {
-        this.#clearPending(monitor);
-        return;
-      }
-      this.#scheduleSettle(monitor, `present:${metadataSignature(metadata)}`);
+      if (
+        monitor.observedSnapshot.metadata &&
+        metadataSignature(metadata) === metadataSignature(monitor.observedSnapshot.metadata)
+      ) return;
+
+      const current = await readPathOnce(monitor.path);
+      const previousHash = monitor.observedSemanticHash;
+      const currentHash = semanticHash(current.text);
+      monitor.observedSnapshot = current;
+      monitor.observedSemanticHash = currentHash;
+      if (currentHash === previousHash) return;
+
+      monitor.pendingMeaningfulChange = true;
+      this.#markMeaningfulActivity(monitor);
+      this.#scheduleSettle(monitor, `present:${currentHash}`);
     } catch (error) {
       if (error.code === "TARGET_NOT_FOUND") {
-        this.#scheduleSettle(monitor, "missing");
+        if (monitor.observedSnapshot.metadata !== null) {
+          monitor.observedSnapshot = { text: "", metadata: null };
+          monitor.observedSemanticHash = semanticHash("");
+          monitor.pendingMeaningfulChange = true;
+          this.#markMeaningfulActivity(monitor);
+          this.#scheduleSettle(monitor, "missing");
+        }
+      } else if (error.code === "TARGET_CHANGED_DURING_READ") {
+        return;
       } else {
         this.#fail(monitor, error);
       }
@@ -930,10 +1123,12 @@ export class MonitorSession {
     clearTimeout(monitor.settleTimer);
     monitor.settleTimer = null;
     monitor.pendingKey = null;
+    monitor.pendingMeaningfulChange = false;
   }
 
   async #settle(monitor, expectedKey) {
     if (monitor.status !== "active" || monitor.pendingKey !== expectedKey) return;
+    monitor.settling = true;
     try {
       let metadata;
       try {
@@ -944,18 +1139,21 @@ export class MonitorSession {
             this.#scheduleSettle(monitor, "missing");
             return;
           }
-          const previous = monitor.snapshot;
-          monitor.snapshot = { text: "", metadata: null };
+          const current = { text: "", metadata: null };
+          monitor.observedSnapshot = current;
+          monitor.observedSemanticHash = semanticHash("");
+          monitor.revisionSnapshot = current;
+          monitor.revisionSemanticHash = semanticHash("");
           monitor.revision += 1;
+          this.#storeRevisionSnapshot(monitor, monitor.revision, current);
+          this.#clearPending(monitor);
           this.#emit(monitor, {
             type: "deleted",
             monitorId: monitor.id,
             path: monitor.path,
             revision: monitor.revision,
-            previousRevision: monitor.revision - 1,
-            observedAt: new Date().toISOString(),
+            observedAt: new Date(this.now()).toISOString(),
             metadata: null,
-            delta: computeLineDelta(previous.text, "", monitor.contextLines),
           });
           this.#stop(monitor, "target-deleted", "stopped");
           return;
@@ -963,45 +1161,60 @@ export class MonitorSession {
         throw error;
       }
 
-      const currentKey = `present:${metadataSignature(metadata)}`;
+      const current = await readStablePath(monitor.path, READ_RETRY_DELAY_MS);
+      const currentHash = semanticHash(current.text);
+      const currentKey = `present:${currentHash}`;
+      const previousObservedHash = monitor.observedSemanticHash;
+      monitor.observedSnapshot = current;
+      monitor.observedSemanticHash = currentHash;
       if (currentKey !== expectedKey) {
+        if (currentHash !== previousObservedHash) this.#markMeaningfulActivity(monitor);
+        monitor.pendingMeaningfulChange = true;
         this.#scheduleSettle(monitor, currentKey);
         return;
       }
-      const current = await readStablePath(monitor.path, monitor.settleMs);
-      const readKey = `present:${metadataSignature(current.metadata)}`;
-      if (readKey !== expectedKey) {
-        this.#scheduleSettle(monitor, readKey);
-        return;
-      }
 
-      const previous = monitor.snapshot;
-      const replaced = identitySignature(previous.metadata) !== identitySignature(current.metadata);
-      if (!replaced && previous.text === current.text) {
-        monitor.snapshot = current;
+      if (currentHash === monitor.revisionSemanticHash) {
         this.#clearPending(monitor);
+        this.#resolveAvailableEventWaiters(monitor);
         return;
       }
 
-      monitor.snapshot = current;
+      const replaced =
+        identitySignature(monitor.revisionSnapshot.metadata) !== identitySignature(current.metadata);
+      monitor.revisionSnapshot = current;
+      monitor.revisionSemanticHash = currentHash;
       monitor.revision += 1;
+      this.#storeRevisionSnapshot(monitor, monitor.revision, current);
       this.#clearPending(monitor);
       this.#emit(monitor, {
         type: replaced ? "replaced" : "changed",
         monitorId: monitor.id,
         path: monitor.path,
         revision: monitor.revision,
-        previousRevision: monitor.revision - 1,
-        observedAt: new Date().toISOString(),
+        observedAt: new Date(this.now()).toISOString(),
         metadata: publicMetadata(current.metadata),
-        delta: computeLineDelta(previous.text, current.text, monitor.contextLines),
       });
     } catch (error) {
       if (error.code === "TARGET_CHANGED_DURING_READ") {
-        void this.#poll(monitor);
+        this.#scheduleSettle(monitor, monitor.pendingKey ?? expectedKey);
         return;
       }
       this.#fail(monitor, error);
+    } finally {
+      monitor.settling = false;
+    }
+  }
+
+  #storeRevisionSnapshot(monitor, revision, snapshot) {
+    monitor.revisionSnapshots.set(revision, snapshot);
+    while (monitor.revisionSnapshots.size > MAX_EVENT_HISTORY + 2) {
+      const removable = [...monitor.revisionSnapshots.keys()].find(
+        (candidate) =>
+          candidate !== monitor.analysisBaselineRevision && candidate !== monitor.revision,
+      );
+      if (removable === undefined) break;
+      monitor.revisionSnapshots.delete(removable);
     }
   }
 
@@ -1010,8 +1223,80 @@ export class MonitorSession {
     monitor.events.push(event);
     if (monitor.events.length > MAX_EVENT_HISTORY) monitor.events.shift();
     for (const waiter of [...monitor.waiters]) {
-      if (event.revision > waiter.afterRevision) waiter.resolve(eventResult(event));
+      if (event.revision > waiter.afterRevision) {
+        waiter.resolve(this.#eventResult(monitor, event, waiter.afterRevision));
+      }
     }
+  }
+
+  #resolveAvailableEventWaiters(monitor) {
+    if (monitor.pendingMeaningfulChange) return;
+    for (const waiter of [...monitor.waiters]) {
+      let event;
+      for (let index = monitor.events.length - 1; index >= 0; index -= 1) {
+        if (monitor.events[index].revision > waiter.afterRevision) {
+          event = monitor.events[index];
+          break;
+        }
+      }
+      if (event) waiter.resolve(this.#eventResult(monitor, event, waiter.afterRevision));
+    }
+  }
+
+  #markMeaningfulActivity(monitor) {
+    monitor.lastMeaningfulActivityAtMs = this.now();
+    monitor.idleWarningIssued = false;
+    monitor.idleWarningPending = false;
+    monitor.idleWarningDelivered = false;
+    this.#scheduleIdleTimer(monitor);
+  }
+
+  #scheduleIdleTimer(monitor) {
+    clearTimeout(monitor.idleTimer);
+    if (monitor.status !== "active") return;
+    const elapsed = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    const threshold = monitor.idleWarningIssued ? this.idleStopMs : this.idleWarningMs;
+    const delay = Math.max(1, threshold - elapsed);
+    monitor.idleTimer = setTimeout(() => this.#handleIdleTimer(monitor), delay);
+    monitor.idleTimer.unref?.();
+  }
+
+  #handleIdleTimer(monitor) {
+    if (monitor.status !== "active") return;
+    const elapsed = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    if (!monitor.idleWarningIssued && elapsed >= this.idleWarningMs) {
+      monitor.idleWarningIssued = true;
+      monitor.idleWarningPending = true;
+      let delivered = false;
+      for (const waiter of [...monitor.waiters]) {
+        waiter.resolve(this.#idleWarningResult(monitor));
+        delivered = true;
+      }
+      if (delivered) {
+        monitor.idleWarningPending = false;
+        monitor.idleWarningDelivered = true;
+      }
+      this.#scheduleIdleTimer(monitor);
+      return;
+    }
+    if (monitor.idleWarningIssued && elapsed >= this.idleStopMs) {
+      this.#stop(monitor, "idle-timeout", "stopped");
+      return;
+    }
+    this.#scheduleIdleTimer(monitor);
+  }
+
+  #idleWarningResult(monitor) {
+    const idleForMs = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    return {
+      state: "idle-warning",
+      monitorId: monitor.id,
+      revision: monitor.revision,
+      status: monitor.status,
+      idleForMs,
+      stopInMs: Math.max(0, this.idleStopMs - idleForMs),
+      message: IDLE_WARNING_MESSAGE,
+    };
   }
 
   #fail(monitor, error) {
@@ -1023,14 +1308,21 @@ export class MonitorSession {
   #stop(monitor, reason, status, resolveWaiters = true) {
     clearInterval(monitor.pollTimer);
     clearTimeout(monitor.settleTimer);
+    clearTimeout(monitor.idleTimer);
     monitor.pollTimer = null;
     monitor.settleTimer = null;
+    monitor.idleTimer = null;
     monitor.pendingKey = null;
+    monitor.pendingMeaningfulChange = false;
     monitor.status = status;
     monitor.reason = reason;
     if (this.activeByPath.get(monitor.path) === monitor.id) this.activeByPath.delete(monitor.path);
     if (!resolveWaiters) return;
-    const result = { state: status === "error" ? "error" : "stopped", ...this.#status(monitor) };
+    const result = {
+      state:
+        status === "error" ? "error" : reason === "idle-timeout" ? "idle-stopped" : "stopped",
+      ...this.#status(monitor),
+    };
     for (const waiter of [...monitor.waiters]) waiter.resolve(result);
   }
 }

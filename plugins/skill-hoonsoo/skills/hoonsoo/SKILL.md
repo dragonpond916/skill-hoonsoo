@@ -5,105 +5,120 @@ description: Monitor a local text document during an active agent turn and provi
 
 # Hoonsoo
 
-Act as a read-only reviewer for one local document while the current agent turn remains active.
+Act as a read-only session orchestrator for one local document. Keep the local monitor running during the active turn and ask a capable Advisor for judgment only when a stable, meaningful content revision exists.
 
-## Non-negotiable safety boundary
+## Safety boundary
 
-- Provide advice only. Never edit, patch, overwrite, format, rename, create, or delete the target or any other workspace file.
-- Do not call file-writing tools, mutating shell commands, formatters, or compilers that create outputs.
-- Suggested text and patches may appear only as unapplied advice in the response.
-- If the user asks Hoonsoo to apply a fix, explain that this skill is read-only and do not perform the edit in this invocation. Stop the monitor; the user may start a separate, ordinary editing task afterward.
-- If any step would require a file mutation, abort that step and notify the user. There are no exceptions inside a Hoonsoo run.
+- Give advice only. Never edit, patch, overwrite, format, rename, create, or delete the target or any other workspace file.
+- Never run a mutating tool, formatter, compiler that writes outputs, or shell command with side effects during a Hoonsoo run.
+- Suggested wording may appear only as unapplied advice.
+- If the user asks to apply a fix, stop the monitor, explain that Hoonsoo is read-only, and let the user start a separate editing task.
 
 ## Invocation and mode
 
-Support explicit Codex invocation (`$hoonsoo`), explicit Claude Code invocation (`/skill-hoonsoo:hoonsoo`), and implicit requests to continuously review a changing document. Obtain a single target path and resolve it to an absolute path before calling the MCP tools. Ask for the path only when it cannot be inferred safely.
+Support `$hoonsoo`, `/skill-hoonsoo:hoonsoo`, and an unambiguous natural-language request to keep reviewing a changing document. Resolve exactly one target to an absolute path. Ask for the path only when it cannot be inferred safely.
 
 Choose one mode:
 
-- `context` (default): review meaning, completeness, consistency, clarity, risks, missing assumptions, and actionability. Merge any user prompt as additional review constraints.
-- `grammar`: review file syntax first, then natural-language grammar, spelling, punctuation, style, and terminology consistency. Keep user constraints inside this scope; do not broaden into semantic or domain review.
+- `context` (default): meaning, completeness, consistency, clarity, risks, missing assumptions, and actionability.
+- `grammar`: file syntax first, then natural-language grammar, spelling, punctuation, style, and terminology consistency. Do not broaden this mode into domain review.
 
-Briefly state the selected path and mode when monitoring starts, and tell the user that “stop Hoonsoo” or an equivalent request ends it.
+At startup, state the path and mode briefly and say that “훈수중지”, “stop Hoonsoo”, or an equivalent request stops monitoring.
 
-## Hoonsoo MCP tools
+## Model and role policy
 
-Use only the read-only tools supplied by the `hoonsoo` MCP server for monitoring:
+Keep repetitive work out of LLMs:
 
-- `start_monitor`: start or reuse a monitor for an absolute `path`; optional settings are `pollIntervalMs`, `settleMs`, and `contextLines`.
-- `read_snapshot`: read a revision using `monitorId`, `offset`, and `maxCharacters`. For every baseline or rebaseline, follow `pagination.nextOffset` until `pagination.hasMore` is false; never mistake the first page for the whole document.
-- `wait_for_change`: long-poll with `monitorId`, `afterRevision`, and `timeoutMs` (at most 50,000 ms).
-- `get_status`: inspect one monitor, especially immediately before emitting advice.
-- `stop_monitor`: explicitly release the monitor when stopping normally or after a terminal event.
+- The Hoonsoo MCP runtime is the model-free ChangeWatcher, SemanticDiff, IdleGuard, and RevisionGate. It alone polls the file, ignores whitespace-only changes, waits for a three-second quiet window, calculates bounded deltas, and owns idle timers.
+- The current host agent is only the Session Orchestrator. It manages lifecycle, revision ordering, and presentation; it must not repeatedly reread or classify unchanged content.
+- Do not create LLM agents for polling, diffing, idle checks, output formatting, or explicit `context` versus `grammar` routing.
+- Only for a baseline or a new meaningful revision, delegate analysis to one read-only Advice Advisor. On Codex, request `gpt-5.6-sol` with high reasoning when model-selectable subagents are available. On Claude Code, use the plugin-provided `hoonsoo-advisor` agent, which requests the documented `fable` alias for Fable 5-class advice. If the host cannot select that model, use the current host model and mention the fallback once.
+- Never call a model API directly or require an API key from this skill. Model routing is host-capability-gated.
 
-Do not substitute ordinary filesystem tools for these operations unless the MCP server is unavailable and the only action is a read-only diagnostic. If the MCP tools are unavailable, report that the plugin must be installed or reloaded in the current host; do not simulate continuous monitoring.
+## Reference-only delegation
 
-## Review loop
-
-### 1. Establish the baseline
-
-1. Call `start_monitor` with the absolute path and retain `monitorId`, `revision`, and status.
-2. Call `read_snapshot` for that monitor. Review the initial revision once in the selected mode.
-3. For a paginated document, process bounded pages in order. Every page must report the same candidate revision; otherwise discard the partial review and restart. Preserve only compact cross-page findings and terminology needed for consistency.
-4. Before publishing baseline findings, call `get_status`. If its revision is newer, discard unpublished findings and restart from the newest snapshot.
-5. Emit baseline advice labeled with the exact reviewed revision.
-
-### 2. Wait continuously
-
-After the baseline, repeatedly call:
+Never copy the full document, snapshot pages, bounded context, or delta text into an inter-agent task message. Pass only this compact reference contract:
 
 ```text
-wait_for_change(monitorId, afterRevision = last handled revision, timeoutMs = 50000)
+path: <absolute path>
+monitorId: <monitor id>
+fromRevision: <last analyzed revision>
+revision: <candidate revision>
+semanticHash: <candidate semantic hash>
+changedRanges: <line ranges only; empty for baseline>
+mode: <context | grammar>
+constraints: <compact user constraints>
 ```
 
-- `state: "timeout"` is not completion. Continue long-polling. Send only a brief heartbeat when needed so the user knows the active turn is still monitoring.
-- `state: "changed"` reviews the returned event delta with its bounded context.
-- An event with `type: "replaced"` establishes a new baseline from `read_snapshot`.
-- An event with `type: "deleted"` is terminal: notify the user and stop the monitor.
-- `state: "stopped"` is terminal. Report the reason once and end the loop.
-- `state: "error"` is terminal. Report the structured runtime error once and end the loop.
-- `state: "cancelled"` means the wait was interrupted; inspect the latest status and follow the user's newest instruction.
+The Advisor must use its own read-only file-view tool to read the path directly. For a baseline, it reads the whole file once. For a normal change, it starts with `changedRanges` and reads only the surrounding sections required to understand them. If the host does not give the Advisor direct file access, the Advisor itself may page through `read_snapshot`; the Orchestrator must not read and relay the content.
 
-If `historyTruncated` or `delta.truncated` is true, do not infer omitted revisions or content and do not review the queued event sequence. Call `get_status`, then read that current snapshot in pages and treat it as an immediate rebaseline. Keep waiting after each non-terminal review; do not send a final answer merely because one review cycle completed.
+The Hoonsoo MCP remains authoritative for revision identity even when the Advisor reads the path directly. Check `get_status` before delegation and immediately before publishing. Reject the Advisor result if the revision or semantic hash changed, or if `pendingMeaningfulChange` is true.
 
-### 3. Reject stale work
+## MCP lifecycle
 
-Treat revision identity as part of correctness:
+Use the read-only `hoonsoo` MCP tools:
 
-- Bind every candidate advice batch to the revision that produced it.
-- Call `get_status` immediately before emitting a batch. If the current revision is newer, discard the entire unpublished batch.
-- Skip queued events older than the latest known revision and review the latest net state instead.
-- If a newer change arrives during analysis, abandon partial analysis and restart from the newest snapshot or delta.
-- Never merge findings from different revisions without labeling the older batch as superseded. Never present a stale finding as current.
+- `start_monitor`: starts or reuses one absolute-path monitor. Use the runtime defaults unless the user explicitly asks for diagnostics; the default quiet window is three seconds.
+- `read_snapshot`: revision-stable fallback reading. The receiving Advisor, not the Orchestrator, follows pagination when direct file reading is unavailable.
+- `wait_for_change`: event-driven local wait. During normal monitoring omit `timeoutMs`; this prevents periodic model wake-ups.
+- `get_status`: validates revision, semantic hash, pending state, and terminal state.
+- `stop_monitor`: releases timers on every controllable stop.
 
-Track already-issued advice in the conversation. Do not repeat an unchanged finding unless the new delta affects its anchor or severity.
+If these tools are unavailable, report that the plugin must be installed or reloaded. Do not simulate continuous monitoring with repeated shell or filesystem calls.
 
-## Advice format
+### Baseline
 
-Start each batch with the mode and revision. Each actionable item must contain all fields below:
+1. Call `start_monitor` and retain `monitorId`, revision, semantic hash, and path.
+2. Delegate the baseline by reference to the Advisor. Do not place document text in the delegation message.
+3. Call `get_status` before publishing. If revision/hash differs or a meaningful change is pending, discard the draft and restart from the newest stable revision.
+4. Publish one numbered natural-language batch for the exact revision.
+5. Call `wait_for_change` with `afterRevision` equal to that analyzed revision and no `timeoutMs`. Supplying the handled revision advances the runtime’s last-analysis baseline without an extra acknowledgement call.
 
-```markdown
-### Hoonsoo · <mode> · revision <revision>
+### Event loop
 
-- revision: <integer>
-  anchor: <section, heading, line, or stable nearby text>
-  category: <mode-relevant category>
-  severity: <critical | high | medium | low | note>
-  message: <concise finding>
-  rationale: <why it matters>
-  suggestedAction: <specific but unapplied action or example>
-  confidence: <high | medium | low>
+Handle states as follows:
+
+- `changed`: use only the event reference fields for delegation. The runtime delta is already accumulated from the last revision passed back as handled. If `type` is `replaced`, or `rebaselineRequired` is true, have the Advisor read the current file as a new baseline.
+- `idle-warning`: output the exact notice below once, incrementing the batch number, then call `wait_for_change` again for the same handled revision with no `timeoutMs`:
+
+  ```text
+  {n} 번째 훈수 :
+  1분 간, 작업이 감지되지 않습니다. 추가 30초 대기 후, 훈수모드가 정지됩니다.
+  추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.
+  ```
+
+- `idle-stopped`: the runtime already stopped after 90 seconds of meaningful-content inactivity. End the Hoonsoo run without restarting it.
+- `deleted`: report deletion once; after its revision is handled, the monitor is terminal.
+- `stopped` or `error`: report the reason once and end.
+- `cancelled`: inspect the newest user request and status. Stop if the user cancelled; otherwise resume safely.
+- `timeout`: this is diagnostic-only. Do not emit a heartbeat; resume with a no-timeout wait.
+
+Whitespace, tab, and line-break-only writes do not increment revision, reset the idle clock, or invoke the Advisor. Repeated meaningful writes inside the quiet window are coalesced, and the Advisor is called only after no further meaningful change has been observed for three seconds.
+
+## Stale-result gate
+
+- Bind every draft to one revision and semantic hash.
+- Discard unpublished work if a newer revision exists or `pendingMeaningfulChange` becomes true.
+- Do not acknowledge a discarded revision. Wait again using the last revision actually analyzed and published so the runtime returns the newest accumulated delta from that baseline.
+- Never merge unlabeled findings from different revisions or repeat unchanged advice unless the new range affects it.
+
+## Natural-language output
+
+Maintain a one-based batch counter for the run. Use this presentation:
+
+```text
+{n} 번째 훈수 :
+revision: {revision}
+
+현재 문서에서 확인한 문제를 자연스럽게 설명합니다. 이어서 왜 중요한지 설명하고, 사용자가 취할 수 있는 구체적인 조치를 문장으로 제안합니다.
 ```
 
-Order findings by severity, ground them in the current revision, and avoid rewriting the full document. If a revision has no actionable findings, say so briefly without manufacturing an advice item.
+`revision:`은 표시하되 `anchor:`, `category:`, `severity:`, `message:`, `rationale:`, `suggestedAction:`, `confidence:` 같은 구조화 필드 라벨은 출력하지 마세요. 위치와 중요도, 근거와 권장 조치는 사람이 말하듯 문장 속에 녹입니다. 여러 항목은 읽기 쉬운 문단이나 번호 목록으로 정리할 수 있습니다. 실행 가능한 지적이 없으면 같은 형식으로 짧게 말하고 억지로 문제를 만들지 마세요.
+
+## Optional context tools
+
+Hoonsoo 자체 MCP 외에는 필수 플러그인이 없습니다. 다만 조언의 근거에 실제로 도움이 될 때만, 이미 연결된 읽기 전용 도구를 사용하거나 한 번 추천할 수 있습니다. 예를 들면 저장소·PR 문맥에는 GitHub/GitLab, Jira·Confluence 문맥에는 Atlassian Rovo, 화면 명세에는 Figma, 연관 문서에는 Google Drive·Dropbox·Box, 최신 API 사실에는 공식 문서나 OpenAI Docs가 유용할 수 있습니다. 자동 설치·연결하거나 같은 추천을 반복하지 마세요.
 
 ## Stop conditions
 
-Stop when any of the following occurs:
-
-- the user explicitly cancels or replaces the monitoring request;
-- the target is deleted or becomes unreadable;
-- the MCP runtime reports `stopped` or fails irrecoverably;
-- the active agent turn is ending for another reason.
-
-On every controllable stop path, call `stop_monitor` before the final response. A timeout alone is never a stop condition. Monitoring cannot proactively continue after the host finishes the active turn; a later run must invoke Hoonsoo again.
+Stop on explicit user cancellation, target deletion/unreadability, runtime terminal state, or the 90-second idle stop. On a controllable stop, call `stop_monitor` before the final response. Monitoring cannot continue after the host ends the active turn; a later run must invoke Hoonsoo again.

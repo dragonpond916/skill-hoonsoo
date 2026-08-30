@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoonsoo:schema:manifest:0.1.0",
+  "$id": "urn:hoonsoo:schema:manifest:0.2.0",
   "title": "Hoonsoo Skill Runtime Manifest",
   "description": "Portable, host-neutral runtime contract for the Hoonsoo advice-only document review skill. This is a Hoonsoo-specific manifest and is intentionally separate from vendor plugin manifests.",
   "$comment": "Referenced file existence, adapter capability completeness, and other cross-object invariants require package-level semantic validation in addition to JSON Schema validation.",
@@ -26,11 +26,11 @@
   "properties": {
     "$schema": {
       "type": "string",
-      "pattern": "^(?:urn:hoonsoo:schema:manifest:0\\.1\\.0|(?:.*\\/)?schemas/hoonsoo\\.manifest\\.schema\\.json)$",
+      "pattern": "^(?:urn:hoonsoo:schema:manifest:0\\.2\\.0|(?:.*\\/)?schemas/hoonsoo\\.manifest\\.schema\\.json)$",
       "description": "URI or relative path of this JSON Schema."
     },
     "schemaVersion": {
-      "const": "0.1.0",
+      "const": "0.2.0",
       "description": "Version of the Hoonsoo manifest contract, independent of the skill package version."
     },
     "kind": {
@@ -515,7 +515,8 @@
               "user-cancelled",
               "session-ended",
               "target-deleted",
-              "runtime-failed"
+              "runtime-failed",
+              "idle-timeout"
             ]
           },
           "uniqueItems": true
@@ -544,6 +545,9 @@
         "mode",
         "pollIntervalMs",
         "settleMs",
+        "meaningfulChangePolicy",
+        "idleWarningMs",
+        "idleStopMs",
         "probe",
         "snapshotRead",
         "initialSnapshot",
@@ -570,6 +574,17 @@
           "minimum": 0,
           "maximum": 60000,
           "description": "Quiet period used to coalesce partial editor writes before snapshotting."
+        },
+        "meaningfulChangePolicy": {
+          "const": "ignore-whitespace-only"
+        },
+        "idleWarningMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "idleStopMs": {
+          "type": "integer",
+          "minimum": 2
         },
         "probe": {
           "enum": [
@@ -683,7 +698,10 @@
             "monitor",
             "diff-checker",
             "field-checker",
-            "main-reviewer"
+            "idle-guard",
+            "revision-gate",
+            "advice-advisor",
+            "session-orchestrator"
           ]
         },
         "implementation": {
@@ -806,7 +824,49 @@
         {
           "properties": {
             "role": {
-              "const": "main-reviewer"
+              "const": "session-orchestrator"
+            }
+          }
+        }
+      ]
+    },
+    "idleGuardAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "idle-guard"
+            }
+          }
+        }
+      ]
+    },
+    "revisionGateAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "revision-gate"
+            }
+          }
+        }
+      ]
+    },
+    "adviceAdvisorAgent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/agent"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "advice-advisor"
             }
           }
         }
@@ -817,7 +877,10 @@
       "required": [
         "monitor",
         "diffChecker",
+        "idleGuard",
+        "revisionGate",
         "fieldChecker",
+        "adviceAdvisor",
         "mainReviewer"
       ],
       "properties": {
@@ -827,8 +890,17 @@
         "diffChecker": {
           "$ref": "#/$defs/diffCheckerAgent"
         },
+        "idleGuard": {
+          "$ref": "#/$defs/idleGuardAgent"
+        },
+        "revisionGate": {
+          "$ref": "#/$defs/revisionGateAgent"
+        },
         "fieldChecker": {
           "$ref": "#/$defs/fieldCheckerAgent"
+        },
+        "adviceAdvisor": {
+          "$ref": "#/$defs/adviceAdvisorAgent"
         },
         "mainReviewer": {
           "$ref": "#/$defs/mainReviewerAgent"
@@ -864,10 +936,10 @@
           "description": "Diffing happens outside the main LLM so unchanged document text is not repeatedly consumed as model input."
         },
         "initialModelInput": {
-          "const": "full-document-once"
+          "const": "advisor-direct-file-read"
         },
         "subsequentModelInput": {
-          "const": "delta-with-bounded-context"
+          "const": "advisor-direct-range-read"
         },
         "contextLines": {
           "type": "integer",
@@ -979,7 +1051,10 @@
           "const": [
             "monitor",
             "diffChecker",
+            "idleGuard",
+            "revisionGate",
             "fieldChecker",
+            "adviceAdvisor",
             "mainReviewer"
           ]
         },
@@ -991,7 +1066,7 @@
           ],
           "properties": {
             "context": {
-              "const": "professional-domain-classification"
+              "const": "explicit-context-scope"
             },
             "grammar": {
               "const": "file-format-and-natural-language-only"
@@ -1296,7 +1371,9 @@
     "adviceContract": {
       "type": "object",
       "required": [
-        "requiredFields",
+        "presentation",
+        "visibleLabels",
+        "forbiddenLabels",
         "severityOrder",
         "includeLocation",
         "includeRationale",
@@ -1305,22 +1382,24 @@
         "overflowPolicy"
       ],
       "properties": {
-        "requiredFields": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "enum": [
-              "revision",
-              "anchor",
-              "category",
-              "severity",
-              "message",
-              "rationale",
-              "suggestedAction",
-              "confidence"
-            ]
-          },
-          "uniqueItems": true
+        "presentation": {
+          "const": "natural-language"
+        },
+        "visibleLabels": {
+          "const": [
+            "revision"
+          ]
+        },
+        "forbiddenLabels": {
+          "const": [
+            "anchor",
+            "category",
+            "severity",
+            "message",
+            "rationale",
+            "suggestedAction",
+            "confidence"
+          ]
         },
         "severityOrder": {
           "const": [
@@ -1538,6 +1617,8 @@
           "required": [
             "initialFullDocumentToModel",
             "subsequentFullDocumentToModel",
+            "interAgentContentPassing",
+            "advisorReadPolicy",
             "snapshotsRemainLocal",
             "retention"
           ],
@@ -1548,6 +1629,12 @@
             "subsequentFullDocumentToModel": {
               "const": false,
               "description": "Subsequent model input contains the delta plus bounded context, never another full-document resend."
+            },
+            "interAgentContentPassing": {
+              "const": "references-only"
+            },
+            "advisorReadPolicy": {
+              "const": "direct-path-read"
             },
             "snapshotsRemainLocal": {
               "const": true

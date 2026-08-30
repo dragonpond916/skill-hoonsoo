@@ -1,11 +1,11 @@
 {
   "$schema": "../schemas/hoonsoo.manifest.schema.json",
-  "schemaVersion": "0.1.0",
+  "schemaVersion": "0.2.0",
   "kind": "HoonsooSkill",
   "metadata": {
     "name": "hoonsoo",
     "displayName": "Hoonsoo",
-    "version": "0.1.0-alpha.1",
+    "version": "0.2.0-alpha.1",
     "description": "Monitor a document during the active LLM session and provide contextual or grammar-focused advice without modifying the source file.",
     "keywords": [
       "advice-only",
@@ -95,7 +95,8 @@
       "user-cancelled",
       "session-ended",
       "target-deleted",
-      "runtime-failed"
+      "runtime-failed",
+      "idle-timeout"
     ],
     "onTargetDeleted": "notify-and-stop",
     "onTargetReplaced": "rebaseline-and-review",
@@ -104,7 +105,10 @@
   "watch": {
     "mode": "polling",
     "pollIntervalMs": 2000,
-    "settleMs": 250,
+    "settleMs": 3000,
+    "meaningfulChangePolicy": "ignore-whitespace-only",
+    "idleWarningMs": 60000,
+    "idleStopMs": 90000,
     "probe": "metadata-first",
     "snapshotRead": "on-change-only",
     "initialSnapshot": "full",
@@ -137,16 +141,16 @@
     "diffChecker": {
       "role": "diff-checker",
       "implementation": "deterministic-worker",
-      "responsibility": "Compute per-revision deltas locally and aggregate the net change from the last acknowledged snapshot.",
+      "responsibility": "Ignore whitespace-only edits, wait for a three-second quiet window, and compute the net local delta from the last analyzed revision.",
       "concurrency": {
         "mode": "bounded-pool",
         "maximum": 8,
         "overflow": "coalesce"
       },
       "inputs": [
-        "previous-snapshot",
-        "current-snapshot",
-        "revision"
+        "target-reference",
+        "analysis-baseline-revision",
+        "candidate-revision"
       ],
       "outputs": [
         "delta",
@@ -155,43 +159,101 @@
       "interruptible": true,
       "effectPolicy": "read-compute-and-emit-only"
     },
-    "fieldChecker": {
-      "role": "field-checker",
-      "implementation": "llm-agent",
-      "modelClass": "fast",
-      "responsibility": "Classify routing metadata before review: professional domains in context mode, and only file format and natural language in grammar mode.",
+    "idleGuard": {
+      "role": "idle-guard",
+      "implementation": "deterministic-worker",
+      "responsibility": "Emit one idle warning after 60 seconds without meaningful content activity and stop the monitor after 90 seconds.",
       "concurrency": {
-        "mode": "per-batch",
-        "maximum": 2,
-        "overflow": "drop-stale"
+        "mode": "singleton",
+        "maximum": 1,
+        "overflow": "coalesce"
       },
       "inputs": [
-        "aggregated-delta",
-        "bounded-context"
+        "meaningful-activity-clock",
+        "idle-policy"
       ],
       "outputs": [
-        "routing-labels",
-        "classification-confidence"
+        "idle-warning",
+        "idle-stop"
       ],
-      "interruptible": true,
+      "interruptible": false,
       "effectPolicy": "read-compute-and-emit-only"
     },
-    "mainReviewer": {
-      "role": "main-reviewer",
-      "implementation": "host-session-agent",
-      "modelClass": "capable",
-      "responsibility": "Review only the current aggregate, merge relevant prior advice, and emit advice into the active session.",
+    "revisionGate": {
+      "role": "revision-gate",
+      "implementation": "deterministic-worker",
+      "responsibility": "Validate revision, semantic hash, and pending meaningful changes before and after advice generation.",
       "concurrency": {
         "mode": "singleton",
         "maximum": 1,
         "overflow": "drop-stale"
       },
       "inputs": [
-        "aggregated-delta",
-        "bounded-context",
-        "routing-labels",
+        "target-reference",
+        "runtime-status"
+      ],
+      "outputs": [
+        "current-reference",
+        "stale-decision"
+      ],
+      "interruptible": false,
+      "effectPolicy": "read-compute-and-emit-only"
+    },
+    "fieldChecker": {
+      "role": "field-checker",
+      "implementation": "deterministic-worker",
+      "responsibility": "Route the explicit context or grammar mode without sending document content to a classification model.",
+      "concurrency": {
+        "mode": "per-batch",
+        "maximum": 2,
+        "overflow": "drop-stale"
+      },
+      "inputs": [
+        "review-profile",
+        "file-extension"
+      ],
+      "outputs": [
+        "review-scope"
+      ],
+      "interruptible": true,
+      "effectPolicy": "read-compute-and-emit-only"
+    },
+    "adviceAdvisor": {
+      "role": "advice-advisor",
+      "implementation": "llm-agent",
+      "modelClass": "capable",
+      "responsibility": "Read the referenced path directly and generate natural-language advice only for a stable meaningful revision.",
+      "concurrency": {
+        "mode": "singleton",
+        "maximum": 1,
+        "overflow": "drop-stale"
+      },
+      "inputs": [
+        "target-reference",
+        "review-scope",
         "user-constraints",
         "relevant-prior-advice"
+      ],
+      "outputs": [
+        "natural-language-advice"
+      ],
+      "interruptible": true,
+      "effectPolicy": "read-compute-and-emit-only"
+    },
+    "mainReviewer": {
+      "role": "session-orchestrator",
+      "implementation": "host-session-agent",
+      "modelClass": "fast",
+      "responsibility": "Coordinate monitor lifecycle and revision-safe output while delegating all document judgment to the Advice Advisor.",
+      "concurrency": {
+        "mode": "singleton",
+        "maximum": 1,
+        "overflow": "drop-stale"
+      },
+      "inputs": [
+        "target-reference",
+        "stale-decision",
+        "natural-language-advice"
       ],
       "outputs": [
         "advice-batch"
@@ -204,18 +266,21 @@
     "sequence": [
       "monitor",
       "diffChecker",
+      "idleGuard",
+      "revisionGate",
       "fieldChecker",
+      "adviceAdvisor",
       "mainReviewer"
     ],
     "routingPolicy": {
-      "context": "professional-domain-classification",
+      "context": "explicit-context-scope",
       "grammar": "file-format-and-natural-language-only"
     },
     "delta": {
       "algorithm": "myers-line",
       "localComputation": true,
-      "initialModelInput": "full-document-once",
-      "subsequentModelInput": "delta-with-bounded-context",
+      "initialModelInput": "advisor-direct-file-read",
+      "subsequentModelInput": "advisor-direct-range-read",
       "contextLines": 5,
       "aggregation": "net-delta-from-last-acknowledged-revision",
       "maxInitialChunkCharacters": 32000,
@@ -224,7 +289,7 @@
       "oversizedDeltaPolicy": "chunk-by-structure"
     },
     "batching": {
-      "coalesceWindowMs": 250,
+      "coalesceWindowMs": 3000,
       "ordering": "revision-ascending",
       "maxQueuedChanges": 64,
       "overflow": "coalesce-to-latest-net-delta"
@@ -237,7 +302,7 @@
       "discardPartialAdvice": true,
       "resumeAfter": "aggregated-delta-ready"
     },
-    "cooldownMs": 2000,
+    "cooldownMs": 3000,
     "staleResultPolicy": "discard-by-generation",
     "acknowledgeRevisionAfter": "advice-emitted-or-buffered"
   },
@@ -342,8 +407,11 @@
       "patches": "suggestion-only"
     },
     "advice": {
-      "requiredFields": [
-        "revision",
+      "presentation": "natural-language",
+      "visibleLabels": [
+        "revision"
+      ],
+      "forbiddenLabels": [
         "anchor",
         "category",
         "severity",
@@ -403,6 +471,8 @@
     "dataHandling": {
       "initialFullDocumentToModel": true,
       "subsequentFullDocumentToModel": false,
+      "interAgentContentPassing": "references-only",
+      "advisorReadPolicy": "direct-path-read",
       "snapshotsRemainLocal": true,
       "retention": "session"
     }
@@ -575,6 +645,42 @@
           }
         }
       }
+    }
+  },
+  "extensions": {
+    "hoonsoo.model-routing": {
+      "mode": "capability-gated",
+      "deterministicRoles": [
+        "monitor",
+        "diffChecker",
+        "idleGuard",
+        "revisionGate",
+        "fieldChecker"
+      ],
+      "hostProfiles": {
+        "codex": {
+          "orchestrator": "current-host-model",
+          "advisor": "gpt-5.6-sol",
+          "advisorReasoning": "high",
+          "fallback": "current-host-model"
+        },
+        "claude-code": {
+          "orchestrator": "current-host-model",
+          "advisor": "fable",
+          "advisorReasoning": "high",
+          "fallback": "current-host-model"
+        }
+      }
+    },
+    "hoonsoo.optional-source-scout": {
+      "enabled": "on-demand-only",
+      "recommendedContexts": [
+        "repository-or-pull-request",
+        "issue-or-wiki",
+        "design-specification",
+        "official-api-documentation"
+      ],
+      "automaticInstallation": false
     }
   }
 }

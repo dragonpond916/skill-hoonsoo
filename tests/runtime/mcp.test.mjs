@@ -143,6 +143,7 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
   });
   assert.equal(initialize.result.protocolVersion, "2024-11-05");
   assert.equal(initialize.result.serverInfo.name, "hoonsoo");
+  assert.equal(initialize.result.serverInfo.version, "0.2.0");
   assert.deepEqual(initialize.result.capabilities, { tools: { listChanged: false } });
   client.notify("notifications/initialized");
 
@@ -160,6 +161,14 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
     assert.equal(tool.annotations.idempotentHint, true);
     assert.equal(tool.annotations.openWorldHint, false);
   }
+  const startDefinition = listed.result.tools.find((tool) => tool.name === "start_monitor");
+  assert.equal(startDefinition.inputSchema.properties.settleMs.default, 3_000);
+  const waitDefinition = listed.result.tools.find((tool) => tool.name === "wait_for_change");
+  assert.equal(
+    Object.hasOwn(waitDefinition.inputSchema.properties.timeoutMs, "default"),
+    false,
+  );
+  assert.match(waitDefinition.description, /Omit timeoutMs/);
 
   const startCall = await client.request("tools/call", {
     name: "start_monitor",

@@ -1,7 +1,7 @@
 interface:
   display_name: "Hoonsoo"
   short_description: "Read-only live context and grammar review"
-  default_prompt: "Use $hoonsoo to monitor a local document in context mode and keep giving read-only advice as it changes."
+  default_prompt: "Use $hoonsoo to monitor a local document, give numbered natural-language advice with its revision only after meaningful changes settle, stay silent while waiting, and stop after the idle policy."
 
 dependencies:
   tools:
