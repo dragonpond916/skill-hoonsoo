@@ -1,96 +1,68 @@
 {
   "$schema": "../schemas/hoonsoo.manifest.schema.json",
-  "schemaVersion": "0.2.0",
+  "schemaVersion": "0.3.0",
   "kind": "HoonsooSkill",
   "metadata": {
     "name": "hoonsoo",
     "displayName": "Hoonsoo",
-    "version": "0.2.0-alpha.1",
-    "description": "Monitor a document during the active LLM session and provide contextual or grammar-focused advice without modifying the source file.",
+    "version": "0.3.0-alpha.1",
+    "description": "Review both document content and grammar after stable saved states without modifying the source file.",
     "keywords": [
       "advice-only",
-      "delta-review",
-      "document-review",
-      "human-in-the-loop"
+      "save-triggered-review",
+      "versioned-artifacts",
+      "document-review"
     ]
   },
   "skill": {
     "standard": "agentskills.io",
     "path": "./skills/hoonsoo/SKILL.md",
-    "frontmatterPolicy": "portable-core-only",
     "implicitInvocation": true
   },
+  "command": {
+    "codexInvocation": "$hoonsoo <filePath> <prompt>",
+    "claudeInvocation": "/skill-hoonsoo:hoonsoo <filePath> <prompt>",
+    "action": "start-or-reconfigure-monitor",
+    "reviewScope": "content-and-grammar",
+    "arguments": [
+      {
+        "name": "filePath",
+        "position": 0,
+        "type": "path",
+        "required": true,
+        "capture": "token",
+        "description": "Absolute local file path. Quote a path that contains spaces."
+      },
+      {
+        "name": "prompt",
+        "position": 1,
+        "type": "string",
+        "required": false,
+        "capture": "remainder",
+        "default": "",
+        "description": "Optional priorities or constraints applied to the combined content and grammar review."
+      }
+    ]
+  },
   "runtime": {
-    "kind": "supervisor-process",
-    "entrypoint": {
-      "command": "hoonsoo-runtime",
-      "args": [
-        "serve"
-      ]
-    },
+    "kind": "stdio-mcp-process",
     "protocol": "jsonl-stdio",
     "state": {
-      "scope": "session",
+      "scope": "monitor-session",
       "storage": "memory",
-      "retention": "until-session-end",
-      "persistDocumentContent": false
-    }
-  },
-  "commands": {
-    "context": {
-      "invocation": "/hoonsoo:context",
-      "summary": "Monitor a document and provide domain-aware contextual advice.",
-      "reviewProfile": "context",
-      "action": "start-or-reconfigure-monitor",
-      "arguments": [
-        {
-          "name": "filePath",
-          "position": 0,
-          "type": "path",
-          "required": true,
-          "capture": "token",
-          "description": "Path of the document to monitor. Quote paths containing spaces."
-        },
-        {
-          "name": "prompt",
-          "position": 1,
-          "type": "string",
-          "required": false,
-          "capture": "remainder",
-          "default": "",
-          "description": "Additional constraints to apply to contextual analysis."
-        }
-      ]
-    },
-    "grammar": {
-      "invocation": "/hoonsoo:grammar",
-      "summary": "Monitor a document and review only syntax, grammar, spelling, and style.",
-      "reviewProfile": "grammar",
-      "action": "start-or-reconfigure-monitor",
-      "arguments": [
-        {
-          "name": "filePath",
-          "position": 0,
-          "type": "path",
-          "required": true,
-          "capture": "token",
-          "description": "Path of the document to monitor. Quote paths containing spaces."
-        },
-        {
-          "name": "prompt",
-          "position": 1,
-          "type": "string",
-          "required": false,
-          "capture": "remainder",
-          "default": "",
-          "description": "Additional constraints that remain limited to grammar and syntax review."
-        }
+      "retention": "until-monitor-stop-or-process-exit",
+      "persistDocumentContent": false,
+      "versionedCollections": [
+        "revisionSnapshots",
+        "diffArtifacts",
+        "fieldArtifacts",
+        "feedbackArtifacts"
       ]
     }
   },
   "lifecycle": {
-    "scope": "active-session",
-    "startOnCommand": true,
+    "scope": "active-agent-turn",
+    "startOnInvocation": true,
     "stopConditions": [
       "user-cancelled",
       "session-ended",
@@ -98,588 +70,273 @@
       "runtime-failed",
       "idle-timeout"
     ],
-    "onTargetDeleted": "notify-and-stop",
-    "onTargetReplaced": "rebaseline-and-review",
-    "monitorUniqueness": "one-per-session-and-target"
+    "onTargetDeleted": "confirm-twice-then-notify-and-stop",
+    "onTargetReplaced": "capture-new-inode-as-saved-revision",
+    "monitorUniqueness": "one-active-monitor-per-process-and-target"
   },
   "watch": {
-    "mode": "polling",
+    "mode": "metadata-polling",
     "pollIntervalMs": 2000,
-    "settleMs": 3000,
-    "meaningfulChangePolicy": "ignore-whitespace-only",
+    "throttling": {
+      "enabled": false
+    },
+    "saveDetection": {
+      "boundary": "stable-disk-snapshot",
+      "candidateMetadata": [
+        "device",
+        "inode",
+        "size",
+        "mtimeNs",
+        "ctimeNs"
+      ],
+      "contentIdentity": "raw-utf8-sha256",
+      "sameContentSave": "activity-only-no-revision",
+      "whitespaceOnlySave": "content-revision",
+      "manualVsAutosave": "not-distinguishable",
+      "consistencyRead": "stat-read-stat-with-bounded-retry",
+      "missingConfirmationProbes": 2
+    },
     "idleWarningMs": 60000,
     "idleStopMs": 90000,
-    "probe": "metadata-first",
-    "snapshotRead": "on-change-only",
-    "initialSnapshot": "full",
-    "snapshotStorage": "memory",
-    "maxSnapshots": 2,
-    "encoding": "auto-detect",
-    "symlinkPolicy": "follow-target",
     "maxFileBytes": 5242880
   },
   "agents": {
-    "monitor": {
-      "role": "monitor",
+    "monitoringAgent": {
+      "role": "save-monitor",
       "implementation": "deterministic-worker",
-      "responsibility": "Probe the target, emit ordered change revisions, and never send unchanged content to an LLM.",
-      "concurrency": {
-        "mode": "singleton",
-        "maximum": 1,
-        "overflow": "coalesce"
-      },
+      "modelClass": "none",
+      "responsibility": "Detect metadata changes, confirm a stable disk snapshot, and distinguish save activity from content revisions.",
       "inputs": [
         "target-path",
-        "watch-policy"
+        "save-detection-policy"
       ],
       "outputs": [
-        "change-event"
+        "save-sequence",
+        "stable-snapshot-reference"
       ],
-      "interruptible": false,
-      "effectPolicy": "read-compute-and-emit-only"
+      "effectPolicy": "read-target-and-update-session-memory-only"
     },
-    "diffChecker": {
-      "role": "diff-checker",
+    "diffCheckAgent": {
+      "role": "revision-diff-checker",
       "implementation": "deterministic-worker",
-      "responsibility": "Ignore whitespace-only edits, wait for a three-second quiet window, and compute the net local delta from the last analyzed revision.",
-      "concurrency": {
-        "mode": "bounded-pool",
-        "maximum": 8,
-        "overflow": "coalesce"
-      },
+      "modelClass": "none",
+      "responsibility": "Version every changed stable snapshot and store bounded changed excerpts and line ranges as session artifacts.",
       "inputs": [
-        "target-reference",
-        "analysis-baseline-revision",
-        "candidate-revision"
+        "previous-revision-snapshot",
+        "current-stable-snapshot"
       ],
       "outputs": [
-        "delta",
-        "revision-range"
+        "revision-artifact",
+        "diff-artifact"
       ],
-      "interruptible": true,
-      "effectPolicy": "read-compute-and-emit-only"
+      "effectPolicy": "compute-and-update-session-memory-only"
+    },
+    "fieldCheckAgent": {
+      "role": "field-checker",
+      "implementation": "llm-agent",
+      "modelClass": "efficient",
+      "responsibility": "Read the referenced revision or diff artifact, identify the document domain, type, language, intent, and useful content and grammar review focus, then store a versioned field artifact.",
+      "inputs": [
+        "monitor-reference",
+        "revision-artifact-reference",
+        "diff-artifact-reference",
+        "prompt-reference"
+      ],
+      "outputs": [
+        "field-artifact-reference"
+      ],
+      "effectPolicy": "read-target-artifacts-and-update-session-memory-only"
+    },
+    "mainReviewAgent": {
+      "role": "combined-reviewer",
+      "implementation": "llm-agent",
+      "modelClass": "flagship",
+      "responsibility": "Read the field artifact, current revision changes, invocation prompt, and relevant published feedback, then store one combined content and grammar feedback draft.",
+      "inputs": [
+        "field-artifact-reference",
+        "review-bundle-reference"
+      ],
+      "outputs": [
+        "feedback-artifact-reference"
+      ],
+      "effectPolicy": "read-target-artifacts-and-update-session-memory-only"
+    },
+    "revisionGate": {
+      "role": "revision-gate",
+      "implementation": "deterministic-worker",
+      "modelClass": "none",
+      "responsibility": "Reject field or feedback writes whose revision, content hash, or source artifact no longer matches the current monitor state.",
+      "inputs": [
+        "artifact-reference",
+        "runtime-status"
+      ],
+      "outputs": [
+        "accepted-artifact",
+        "stale-decision"
+      ],
+      "effectPolicy": "validate-session-memory-only"
     },
     "idleGuard": {
       "role": "idle-guard",
       "implementation": "deterministic-worker",
-      "responsibility": "Emit one idle warning after 60 seconds without meaningful content activity and stop the monitor after 90 seconds.",
-      "concurrency": {
-        "mode": "singleton",
-        "maximum": 1,
-        "overflow": "coalesce"
-      },
+      "modelClass": "none",
+      "responsibility": "Reset on a content-changing saved revision, warn once after 60 seconds without content change, and stop after 90 seconds.",
       "inputs": [
-        "meaningful-activity-clock",
+        "last-content-revision",
         "idle-policy"
       ],
       "outputs": [
         "idle-warning",
         "idle-stop"
       ],
-      "interruptible": false,
-      "effectPolicy": "read-compute-and-emit-only"
+      "effectPolicy": "timer-and-session-state-only"
     },
-    "revisionGate": {
-      "role": "revision-gate",
-      "implementation": "deterministic-worker",
-      "responsibility": "Validate revision, semantic hash, and pending meaningful changes before and after advice generation.",
-      "concurrency": {
-        "mode": "singleton",
-        "maximum": 1,
-        "overflow": "drop-stale"
-      },
+    "sessionOrchestrator": {
+      "role": "host-session-orchestrator",
+      "implementation": "host-agent",
+      "modelClass": "current-host",
+      "responsibility": "Pass artifact references between stages, validate the latest revision, publish stored natural-language feedback, mark it published, and resume a no-timeout wait.",
       "inputs": [
-        "target-reference",
+        "artifact-references",
         "runtime-status"
       ],
       "outputs": [
-        "current-reference",
-        "stale-decision"
+        "numbered-advice-batch"
       ],
-      "interruptible": false,
-      "effectPolicy": "read-compute-and-emit-only"
-    },
-    "fieldChecker": {
-      "role": "field-checker",
-      "implementation": "deterministic-worker",
-      "responsibility": "Route the explicit context or grammar mode without sending document content to a classification model.",
-      "concurrency": {
-        "mode": "per-batch",
-        "maximum": 2,
-        "overflow": "drop-stale"
-      },
-      "inputs": [
-        "review-profile",
-        "file-extension"
-      ],
-      "outputs": [
-        "review-scope"
-      ],
-      "interruptible": true,
-      "effectPolicy": "read-compute-and-emit-only"
-    },
-    "adviceAdvisor": {
-      "role": "advice-advisor",
-      "implementation": "llm-agent",
-      "modelClass": "capable",
-      "responsibility": "Read the referenced path directly and generate natural-language advice only for a stable meaningful revision.",
-      "concurrency": {
-        "mode": "singleton",
-        "maximum": 1,
-        "overflow": "drop-stale"
-      },
-      "inputs": [
-        "target-reference",
-        "review-scope",
-        "user-constraints",
-        "relevant-prior-advice"
-      ],
-      "outputs": [
-        "natural-language-advice"
-      ],
-      "interruptible": true,
-      "effectPolicy": "read-compute-and-emit-only"
-    },
-    "mainReviewer": {
-      "role": "session-orchestrator",
-      "implementation": "host-session-agent",
-      "modelClass": "fast",
-      "responsibility": "Coordinate monitor lifecycle and revision-safe output while delegating all document judgment to the Advice Advisor.",
-      "concurrency": {
-        "mode": "singleton",
-        "maximum": 1,
-        "overflow": "drop-stale"
-      },
-      "inputs": [
-        "target-reference",
-        "stale-decision",
-        "natural-language-advice"
-      ],
-      "outputs": [
-        "advice-batch"
-      ],
-      "interruptible": true,
-      "effectPolicy": "read-compute-and-emit-only"
+      "effectPolicy": "presentation-and-session-control-only"
     }
   },
   "pipeline": {
     "sequence": [
-      "monitor",
-      "diffChecker",
-      "idleGuard",
+      "monitoringAgent",
+      "diffCheckAgent",
+      "fieldCheckAgent",
+      "mainReviewAgent",
       "revisionGate",
-      "fieldChecker",
-      "adviceAdvisor",
-      "mainReviewer"
+      "sessionOrchestrator"
     ],
-    "routingPolicy": {
-      "context": "explicit-context-scope",
-      "grammar": "file-format-and-natural-language-only"
+    "baseline": {
+      "revision": 0,
+      "fieldInput": "full-revision-artifact",
+      "review": "combined-content-and-grammar"
     },
-    "delta": {
-      "algorithm": "myers-line",
-      "localComputation": true,
-      "initialModelInput": "advisor-direct-file-read",
-      "subsequentModelInput": "advisor-direct-range-read",
-      "contextLines": 5,
-      "aggregation": "net-delta-from-last-acknowledged-revision",
-      "maxInitialChunkCharacters": 32000,
-      "initialOversizedPolicy": "chunk-by-structure",
-      "maxDeltaCharacters": 24000,
-      "oversizedDeltaPolicy": "chunk-by-structure"
+    "savedRevision": {
+      "fieldInput": "diff-artifact",
+      "reviewInput": "review-bundle",
+      "review": "combined-content-and-grammar"
     },
-    "batching": {
-      "coalesceWindowMs": 3000,
-      "ordering": "revision-ascending",
-      "maxQueuedChanges": 64,
-      "overflow": "coalesce-to-latest-net-delta"
-    },
-    "interruption": {
-      "trigger": "new-change-during-main-review",
-      "runtimeReviewAction": "abort-active-review",
-      "hostGenerationAction": "capability-gated",
-      "onUnsupportedHostInterrupt": "mark-stale-and-discard",
-      "discardPartialAdvice": true,
-      "resumeAfter": "aggregated-delta-ready"
-    },
-    "cooldownMs": 3000,
-    "staleResultPolicy": "discard-by-generation",
-    "acknowledgeRevisionAfter": "advice-emitted-or-buffered"
+    "backlogPolicy": "latest-revision-wins-with-aggregate-diff-from-last-published",
+    "staleResultPolicy": "reject-by-revision-content-hash-and-artifact-id",
+    "interAgentPayload": "artifact-references-only",
+    "normalWait": "event-driven-without-timeout"
   },
-  "reviewProfiles": {
-    "context": {
-      "semanticAnalysis": true,
-      "userPromptPolicy": "merge-as-additional-constraints",
-      "domainClassification": {
-        "enabled": true,
-        "multiLabel": true,
-        "taxonomy": [
-          "development",
-          "legal",
-          "product-management",
-          "planning",
-          "design",
-          "data-science",
-          "business",
-          "general"
-        ],
-        "fallback": "general"
-      },
-      "recommendationFocus": [
-        "completeness",
-        "consistency",
-        "clarity",
-        "risk",
-        "missing-assumptions",
-        "actionability"
-      ]
-    },
-    "grammar": {
-      "semanticAnalysis": false,
-      "userPromptPolicy": "apply-only-to-grammar-and-syntax-scope",
-      "validationOrder": [
-        "file-syntax",
-        "natural-language-grammar",
-        "spelling",
-        "style"
-      ],
-      "syntaxValidation": {
-        "enabled": true,
-        "priority": "first",
-        "validators": [
-          {
-            "id": "markdown",
-            "extensions": [
-              ".md",
-              ".mdx"
-            ],
-            "checks": [
-              "structure",
-              "headings",
-              "lists",
-              "links",
-              "fenced-code-blocks"
-            ]
-          },
-          {
-            "id": "java",
-            "extensions": [
-              ".java"
-            ],
-            "checks": [
-              "parse",
-              "syntax",
-              "compile"
-            ],
-            "compileWhenProjectContextAvailable": true
-          }
-        ],
-        "toolUnavailablePolicy": "report-limitation-and-continue",
-        "sideEffectIsolation": "temporary-workspace-only"
-      },
-      "naturalLanguageValidation": {
-        "enabled": true,
-        "languageDetection": "automatic",
-        "scope": "human-language-segments",
-        "checks": [
-          "grammar",
-          "spelling",
-          "punctuation",
-          "style",
-          "terminology-consistency"
-        ],
-        "thoroughness": "exhaustive"
-      }
-    }
+  "mcpTools": {
+    "monitoring": [
+      "start_monitor",
+      "wait_for_save",
+      "get_status",
+      "stop_monitor"
+    ],
+    "artifactReads": [
+      "read_revision",
+      "read_diff_artifact",
+      "read_field_analysis",
+      "read_review_bundle",
+      "read_feedback_artifact"
+    ],
+    "sessionWrites": [
+      "store_field_analysis",
+      "store_feedback_draft",
+      "mark_feedback_published"
+    ]
+  },
+  "review": {
+    "scope": "content-and-grammar",
+    "promptPolicy": "merge-as-additional-priorities",
+    "contentChecks": [
+      "completeness",
+      "consistency",
+      "clarity",
+      "risk",
+      "missing-assumptions",
+      "actionability"
+    ],
+    "grammarChecks": [
+      "file-syntax",
+      "natural-language-grammar",
+      "spelling",
+      "punctuation",
+      "style",
+      "terminology-consistency",
+      "whitespace-and-formatting"
+    ]
   },
   "output": {
     "mode": "advice-only",
-    "delivery": {
-      "destination": "active-session",
-      "timing": "incremental",
-      "format": "markdown",
-      "updateStrategy": "append-update-or-invalidate-by-anchor",
-      "unsupportedPushFallback": "buffer-until-next-host-turn"
-    },
-    "mutation": {
-      "targetFile": "forbidden",
-      "fullDocumentRewrite": "forbidden",
-      "patches": "suggestion-only"
-    },
-    "advice": {
-      "presentation": "natural-language",
-      "visibleLabels": [
-        "revision"
-      ],
-      "forbiddenLabels": [
-        "anchor",
-        "category",
-        "severity",
-        "message",
-        "rationale",
-        "suggestedAction",
-        "confidence"
-      ],
-      "severityOrder": [
-        "critical",
-        "high",
-        "medium",
-        "low",
-        "note"
-      ],
-      "includeLocation": true,
-      "includeRationale": true,
-      "includeSuggestedAction": true,
-      "maxItemsPerCycle": 50,
-      "overflowPolicy": "continue-in-next-batch"
-    }
-  },
-  "safety": {
-    "policy": "advice-only",
-    "scope": "all-modes-agents-runtimes-and-adapters",
-    "userFileMutation": "forbidden",
-    "workspaceMutation": "forbidden",
-    "targetOpenMode": "read-only",
-    "writeCapabilities": "not-granted",
-    "editTools": "excluded",
-    "patchApplication": "forbidden",
-    "autoFix": "forbidden",
-    "exceptions": "none",
-    "runtimeTempWrites": "isolated-outside-user-workspace-only",
-    "onViolation": "abort-review-and-notify"
+    "presentation": "numbered-natural-language",
+    "visibleLabels": [
+      "revision"
+    ],
+    "forbiddenLabels": [
+      "anchor",
+      "category",
+      "severity",
+      "message",
+      "rationale",
+      "suggestedAction",
+      "confidence"
+    ],
+    "targetMutation": "forbidden"
   },
   "permissions": {
     "filesystem": {
       "readTarget": true,
-      "watchTarget": true,
+      "observeTarget": true,
       "writeTarget": false,
-      "writeWorkspace": false,
-      "runtimeTempWrite": "isolated-outside-user-workspace-only"
+      "writeWorkspace": false
     },
-    "process": {
-      "spawn": "required",
-      "shell": false,
-      "sideEffectPolicy": "read-only-user-workspace"
+    "runtimeMemory": {
+      "writeVersionedArtifacts": true,
+      "persistAfterStop": false
     },
     "network": {
       "mode": "none"
     },
-    "session": {
-      "emitAdvice": "preferred",
-      "interruptHostGeneration": "preferred"
-    },
     "dataHandling": {
-      "initialFullDocumentToModel": true,
-      "subsequentFullDocumentToModel": false,
-      "interAgentContentPassing": "references-only",
-      "advisorReadPolicy": "direct-path-read",
+      "documentInterAgentPassing": "references-only",
+      "artifactReads": "direct-mcp-access",
       "snapshotsRemainLocal": true,
-      "retention": "session"
-    }
-  },
-  "hostContract": {
-    "packaging": {
-      "pluginStandard": "agent-plugins/1.0.0",
-      "pluginSchema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-      "skillStandard": "agentskills.io"
-    },
-    "compatibilityStatement": "portable-packaging-with-capability-gated-runtime-behavior",
-    "capabilities": {
-      "filesystem.read": {
-        "requirement": "required"
-      },
-      "filesystem.observe": {
-        "requirement": "preferred",
-        "fallback": "Use local polling at watch.pollIntervalMs."
-      },
-      "commands.namespaced": {
-        "requirement": "preferred",
-        "fallback": "Expose equivalent host-native skill aliases while preserving filePath, prompt, and reviewProfile semantics."
-      },
-      "tools.file-mutation-deny": {
-        "requirement": "required"
-      },
-      "runtime.background-process": {
-        "requirement": "required"
-      },
-      "runtime.review-cancel": {
-        "requirement": "required"
-      },
-      "session.emit": {
-        "requirement": "preferred",
-        "fallback": "Buffer the newest advice until the next host turn."
-      },
-      "host.generation-interrupt": {
-        "requirement": "optional",
-        "fallback": "Cancel Hoonsoo's runtime review, increment the generation, and discard stale output."
-      },
-      "agents.concurrent": {
-        "requirement": "optional",
-        "fallback": "Use the runtime worker pool or execute field classification sequentially."
-      }
-    },
-    "adapters": {
-      "claude-code": {
-        "status": "experimental",
-        "descriptor": "./.claude-plugin/plugin.json",
-        "capabilities": {
-          "filesystem.read": {
-            "support": "native"
-          },
-          "filesystem.observe": {
-            "support": "bridge",
-            "mechanism": "Plugin monitor or FileChanged hook coordinated by the Hoonsoo supervisor."
-          },
-          "commands.namespaced": {
-            "support": "native",
-            "mechanism": "Plugin skills named context and grammar expose /hoonsoo:context and /hoonsoo:grammar."
-          },
-          "tools.file-mutation-deny": {
-            "support": "bridge",
-            "mechanism": "Run Hoonsoo roles without Edit, Write, or patch tools; expose no mutation operation from the supervisor."
-          },
-          "runtime.background-process": {
-            "support": "bridge",
-            "mechanism": "Plugin monitor or an adapter-managed supervisor process."
-          },
-          "runtime.review-cancel": {
-            "support": "bridge",
-            "mechanism": "Abort the Hoonsoo-owned review request and advance its generation."
-          },
-          "session.emit": {
-            "support": "bridge",
-            "mechanism": "Experimental plugin monitor notifications.",
-            "fallback": "Deliver on the next host turn."
-          },
-          "host.generation-interrupt": {
-            "support": "degraded",
-            "mechanism": "Requires an Agent SDK streaming supervisor rather than plugin metadata alone.",
-            "fallback": "Discard stale Hoonsoo results."
-          },
-          "agents.concurrent": {
-            "support": "bridge",
-            "mechanism": "Claude subagents or the Hoonsoo runtime worker pool."
-          }
-        }
-      },
-      "gemini-cli": {
-        "status": "planned",
-        "descriptor": "./gemini-extension.json",
-        "capabilities": {
-          "filesystem.read": {
-            "support": "native"
-          },
-          "filesystem.observe": {
-            "support": "bridge",
-            "mechanism": "Companion runtime exposed through an MCP server."
-          },
-          "commands.namespaced": {
-            "support": "native",
-            "mechanism": "commands/hoonsoo/context.toml and grammar.toml expose the logical commands."
-          },
-          "tools.file-mutation-deny": {
-            "support": "bridge",
-            "mechanism": "Exclude workspace-writing tools from Hoonsoo roles and expose only read/monitor/advice MCP operations."
-          },
-          "runtime.background-process": {
-            "support": "bridge",
-            "mechanism": "A stdio MCP server owns the watcher lifecycle."
-          },
-          "runtime.review-cancel": {
-            "support": "bridge",
-            "mechanism": "Abort the Hoonsoo-owned review request and advance its generation."
-          },
-          "session.emit": {
-            "support": "degraded",
-            "fallback": "Return the latest aggregate on the next MCP tool call or host turn."
-          },
-          "host.generation-interrupt": {
-            "support": "unsupported",
-            "fallback": "Abort only the Hoonsoo runtime request and discard its stale result."
-          },
-          "agents.concurrent": {
-            "support": "bridge",
-            "mechanism": "Gemini subagents or the Hoonsoo runtime worker pool."
-          }
-        }
-      },
-      "codex": {
-        "status": "planned",
-        "descriptor": "./.codex-plugin/plugin.json",
-        "capabilities": {
-          "filesystem.read": {
-            "support": "native"
-          },
-          "filesystem.observe": {
-            "support": "bridge",
-            "mechanism": "Companion supervisor with polling or host lifecycle hooks."
-          },
-          "commands.namespaced": {
-            "support": "degraded",
-            "mechanism": "Generate host-native skill aliases from the two logical command definitions.",
-            "fallback": "Use explicit skill invocation when exact namespaced slash commands are unavailable."
-          },
-          "tools.file-mutation-deny": {
-            "support": "bridge",
-            "mechanism": "Exclude file-editing and patch tools from Hoonsoo roles; the runtime exposes no mutation operation."
-          },
-          "runtime.background-process": {
-            "support": "bridge",
-            "mechanism": "A plugin-bundled supervisor or stdio MCP server owns the watcher lifecycle."
-          },
-          "runtime.review-cancel": {
-            "support": "bridge",
-            "mechanism": "Abort the Hoonsoo-owned review request and advance its generation."
-          },
-          "session.emit": {
-            "support": "unknown",
-            "fallback": "Buffer advice until the next host turn."
-          },
-          "host.generation-interrupt": {
-            "support": "unsupported",
-            "fallback": "Abort only the Hoonsoo runtime request and discard its stale result."
-          },
-          "agents.concurrent": {
-            "support": "bridge",
-            "mechanism": "Codex subagents or the Hoonsoo runtime worker pool."
-          }
-        }
-      }
+      "retention": "monitor-session"
     }
   },
   "extensions": {
     "hoonsoo.model-routing": {
-      "mode": "capability-gated",
+      "mode": "host-capability-gated",
       "deterministicRoles": [
-        "monitor",
-        "diffChecker",
-        "idleGuard",
+        "monitoringAgent",
+        "diffCheckAgent",
         "revisionGate",
-        "fieldChecker"
+        "idleGuard"
       ],
       "hostProfiles": {
         "codex": {
-          "orchestrator": "current-host-model",
-          "advisor": "gpt-5.6-sol",
-          "advisorReasoning": "high",
+          "fieldChecker": "gpt-5.6-luna",
+          "fieldCheckerReasoning": "low",
+          "mainReviewer": "gpt-5.6-sol",
+          "mainReviewerReasoning": "high",
           "fallback": "current-host-model"
         },
         "claude-code": {
-          "orchestrator": "current-host-model",
-          "advisor": "fable",
-          "advisorReasoning": "high",
+          "fieldChecker": "haiku",
+          "fieldCheckerReasoning": "low",
+          "mainReviewer": "fable",
+          "mainReviewerReasoning": "high",
           "fallback": "current-host-model"
         }
       }
     },
     "hoonsoo.optional-source-scout": {
       "enabled": "on-demand-only",
-      "recommendedContexts": [
-        "repository-or-pull-request",
-        "issue-or-wiki",
-        "design-specification",
-        "official-api-documentation"
-      ],
       "automaticInstallation": false
     }
   }

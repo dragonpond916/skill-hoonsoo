@@ -10,6 +10,7 @@ const packagedFiles = [
   ".claude-plugin/plugin.json",
   ".codex-plugin/plugin.json",
   "agents/hoonsoo-advisor.md",
+  "agents/hoonsoo-field-checker.md",
   "claude.mcp.json",
   "scripts/hoonsoo-mcp.mjs",
   "skills/hoonsoo/SKILL.md",

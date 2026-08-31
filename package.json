@@ -1,8 +1,8 @@
 {
   "name": "skill-hoonsoo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Read-only document monitoring plugin for Codex and Claude Code",
+  "description": "Read-only saved-revision document review plugin for Codex and Claude Code",
   "type": "module",
   "engines": {
     "node": ">=18.12"

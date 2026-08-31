@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hoonsoo",
-  "version": "0.2.0-alpha.1",
-  "description": "Real-time, advice-only document review for human-in-the-loop LLM sessions.",
+  "version": "0.3.0-alpha.1",
+  "description": "Saved-revision, advice-only document review for human-in-the-loop LLM sessions.",
   "keywords": [
     "document-review",
     "human-in-the-loop",

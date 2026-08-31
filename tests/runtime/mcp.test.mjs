@@ -129,7 +129,7 @@ afterEach(async () => {
   );
 });
 
-test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async () => {
+test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "large-document.md");
   await writeFile(target, "x".repeat(100_000), "utf8");
@@ -143,7 +143,7 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
   });
   assert.equal(initialize.result.protocolVersion, "2024-11-05");
   assert.equal(initialize.result.serverInfo.name, "hoonsoo");
-  assert.equal(initialize.result.serverInfo.version, "0.2.0");
+  assert.equal(initialize.result.serverInfo.version, "0.3.0");
   assert.deepEqual(initialize.result.capabilities, { tools: { listChanged: false } });
   client.notify("notifications/initialized");
 
@@ -153,41 +153,63 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
   const listed = await client.request("tools/list");
   assert.deepEqual(
     listed.result.tools.map((tool) => tool.name),
-    ["start_monitor", "read_snapshot", "wait_for_change", "get_status", "stop_monitor"],
+    [
+      "start_monitor",
+      "read_revision",
+      "wait_for_save",
+      "read_diff_artifact",
+      "store_field_analysis",
+      "read_field_analysis",
+      "read_review_bundle",
+      "store_feedback_draft",
+      "read_feedback_artifact",
+      "mark_feedback_published",
+      "get_status",
+      "stop_monitor",
+    ],
   );
+  const sessionMemoryStores = new Set([
+    "store_field_analysis",
+    "store_feedback_draft",
+    "mark_feedback_published",
+  ]);
   for (const tool of listed.result.tools) {
-    assert.equal(tool.annotations.readOnlyHint, true);
+    assert.equal(tool.annotations.readOnlyHint, !sessionMemoryStores.has(tool.name));
     assert.equal(tool.annotations.destructiveHint, false);
     assert.equal(tool.annotations.idempotentHint, true);
     assert.equal(tool.annotations.openWorldHint, false);
   }
   const startDefinition = listed.result.tools.find((tool) => tool.name === "start_monitor");
-  assert.equal(startDefinition.inputSchema.properties.settleMs.default, 3_000);
-  const waitDefinition = listed.result.tools.find((tool) => tool.name === "wait_for_change");
+  assert.deepEqual(startDefinition.inputSchema.required, ["path"]);
+  assert.equal(Object.hasOwn(startDefinition.inputSchema.properties, "settleMs"), false);
+  assert.equal(startDefinition.inputSchema.properties.prompt.maxLength, 8_000);
+  const waitDefinition = listed.result.tools.find((tool) => tool.name === "wait_for_save");
   assert.equal(
     Object.hasOwn(waitDefinition.inputSchema.properties.timeoutMs, "default"),
     false,
   );
-  assert.match(waitDefinition.description, /Omit timeoutMs/);
 
   const startCall = await client.request("tools/call", {
     name: "start_monitor",
-    arguments: { path: target, pollIntervalMs: 25, settleMs: 10 },
+    arguments: { path: target, prompt: "Review content and grammar.", pollIntervalMs: 25 },
   });
   assert.equal(startCall.result.isError, undefined);
   const started = startCall.result.structuredContent;
   assert.equal(started.status, "active");
   assert.equal(started.revision, 0);
+  assert.match(started.promptRef, /^prompt-monitor-\d+-[a-f0-9]{16}$/);
 
   const snapshotCall = await client.request("tools/call", {
-    name: "read_snapshot",
-    arguments: { monitorId: started.monitorId },
+    name: "read_revision",
+    arguments: { monitorId: started.monitorId, revision: 0 },
   });
   const snapshot = snapshotCall.result.structuredContent;
   assert.equal(snapshot.content.length, 32_000);
   assert.equal(snapshot.pagination.totalCharacters, 100_000);
   assert.equal(snapshot.pagination.nextOffset, 32_000);
   assert.equal(snapshot.pagination.hasMore, true);
+  assert.equal(snapshot.promptRef, started.promptRef);
+  assert.equal(snapshot.prompt, "Review content and grammar.");
   assert.ok(JSON.stringify(snapshotCall).length < 100_000);
 
   const statusCall = await client.request("tools/call", {
@@ -197,7 +219,7 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
   assert.equal(statusCall.result.structuredContent.monitorId, started.monitorId);
 
   const waitCall = await client.request("tools/call", {
-    name: "wait_for_change",
+    name: "wait_for_save",
     arguments: { monitorId: started.monitorId, afterRevision: 0, timeoutMs: 0 },
   });
   assert.equal(waitCall.result.structuredContent.state, "timeout");
@@ -206,18 +228,77 @@ test("serves the MCP lifecycle and all read-only tools over JSONL stdio", async 
   const changedCall = await client.request(
     "tools/call",
     {
-      name: "wait_for_change",
+      name: "wait_for_save",
       arguments: { monitorId: started.monitorId, afterRevision: 0, timeoutMs: 3_000 },
     },
     5_000,
   );
-  assert.equal(changedCall.result.structuredContent.state, "changed");
+  assert.equal(changedCall.result.structuredContent.state, "saved");
   assert.equal(changedCall.result.structuredContent.event.type, "changed");
   assert.equal(changedCall.result.structuredContent.event.revision, 1);
 
+  const changed = changedCall.result.structuredContent.event;
+  const diffCall = await client.request("tools/call", {
+    name: "read_diff_artifact",
+    arguments: { monitorId: started.monitorId, diffArtifactId: changed.diffArtifactId },
+  });
+  assert.equal(diffCall.result.structuredContent.revision, 1);
+  assert.match(diffCall.result.structuredContent.content, /y/);
+  assert.equal(diffCall.result.structuredContent.promptRef, started.promptRef);
+
+  const fieldCall = await client.request("tools/call", {
+    name: "store_field_analysis",
+    arguments: {
+      monitorId: started.monitorId,
+      revision: 1,
+      contentHash: changed.contentHash,
+      sourceArtifactId: changed.diffArtifactId,
+      field: "technical document",
+      analysis: "FieldChecker result",
+    },
+  });
+  assert.equal(fieldCall.result.isError, undefined);
+  const field = fieldCall.result.structuredContent;
+  const bundleCall = await client.request("tools/call", {
+    name: "read_review_bundle",
+    arguments: {
+      monitorId: started.monitorId,
+      revision: 1,
+      contentHash: changed.contentHash,
+      sourceArtifactId: changed.diffArtifactId,
+      fieldArtifactId: field.fieldArtifactId,
+    },
+  });
+  assert.equal(bundleCall.result.structuredContent.prompt, "Review content and grammar.");
+  assert.equal(bundleCall.result.structuredContent.promptRef, started.promptRef);
+
+  const draftCall = await client.request("tools/call", {
+    name: "store_feedback_draft",
+    arguments: {
+      monitorId: started.monitorId,
+      revision: 1,
+      contentHash: changed.contentHash,
+      sourceArtifactId: changed.diffArtifactId,
+      fieldArtifactId: field.fieldArtifactId,
+      feedback: "Natural-language feedback",
+    },
+  });
+  const draft = draftCall.result.structuredContent;
+  const publishCall = await client.request("tools/call", {
+    name: "mark_feedback_published",
+    arguments: {
+      monitorId: started.monitorId,
+      feedbackArtifactId: draft.feedbackArtifactId,
+      revision: 1,
+      contentHash: changed.contentHash,
+      expectedPublishedRevision: -1,
+    },
+  });
+  assert.equal(publishCall.result.structuredContent.publishedRevision, 1);
+
   const changedSnapshotCall = await client.request("tools/call", {
-    name: "read_snapshot",
-    arguments: { monitorId: started.monitorId, offset: 99_999, maxCharacters: 1 },
+    name: "read_revision",
+    arguments: { monitorId: started.monitorId, revision: 1, offset: 99_999, maxCharacters: 1 },
   });
   assert.equal(changedSnapshotCall.result.structuredContent.revision, 1);
   assert.equal(changedSnapshotCall.result.structuredContent.content, "y");
@@ -273,7 +354,7 @@ test("honors JSON-RPC cancellation for a long wait", async () => {
   const waiting = client.request(
     "tools/call",
     {
-      name: "wait_for_change",
+      name: "wait_for_save",
       arguments: { monitorId, afterRevision: 0, timeoutMs: 50_000 },
     },
     3_000,

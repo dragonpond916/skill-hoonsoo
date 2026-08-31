@@ -1,8 +1,8 @@
 {
   "name": "skill-hoonsoo",
   "displayName": "Hoonsoo",
-  "version": "0.2.0",
-  "description": "Read-only live context and grammar review for local documents.",
+  "version": "0.3.0",
+  "description": "Read-only combined content and grammar review for saved local document revisions.",
   "author": {
     "name": "dragonpond",
     "url": "https://github.com/dragonpond916"
@@ -11,8 +11,10 @@
   "repository": "https://github.com/dragonpond916/skill-hoonsoo",
   "keywords": [
     "review",
+    "context",
     "grammar",
     "document",
+    "save-aware",
     "mcp"
   ],
   "skills": "./skills/",

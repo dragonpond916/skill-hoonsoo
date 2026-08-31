@@ -1,6 +1,6 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, unlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -10,9 +10,8 @@ import {
   MAX_DELTA_CHARACTERS,
   MAX_FILE_BYTES,
   MonitorSession,
+  computeContentHash,
   computeLineDelta,
-  computeMeaningfulLineDelta,
-  normalizeMeaningfulText,
   normalizeTargetPath,
 } from "../../scripts/hoonsoo-mcp.mjs";
 
@@ -39,6 +38,26 @@ async function withDeadline(promise, milliseconds = 1_000) {
   }
 }
 
+async function waitUntil(predicate, milliseconds = 1_000) {
+  const deadline = Date.now() + milliseconds;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await delay(5);
+  }
+  throw new Error(`Condition was not met within ${milliseconds} ms`);
+}
+
+async function waitForSaved(session, monitorId, afterRevision, milliseconds = 1_000) {
+  const result = await session.waitForSave({
+    monitorId,
+    afterRevision,
+    timeoutMs: milliseconds,
+  });
+  assert.equal(result.state, "saved");
+  return result;
+}
+
 after(async () => {
   for (const session of sessions) session.close();
   await Promise.all(
@@ -46,19 +65,18 @@ after(async () => {
   );
 });
 
-test("normalizes only absolute paths", () => {
+test("normalizes only absolute paths and hashes raw whitespace", () => {
   const absolute = path.join(tmpdir(), "folder", "..", "document.md");
   assert.equal(normalizeTargetPath(absolute), path.join(tmpdir(), "document.md"));
   assert.throws(() => normalizeTargetPath("relative.md"), { code: "INVALID_PATH" });
+  assert.notEqual(computeContentHash("alpha beta"), computeContentHash("alpha  beta"));
 });
 
-test("computes a bounded line delta with surrounding context", () => {
+test("computes bounded line deltas with context and payload caps", () => {
   const delta = computeLineDelta("first\nsecond\nthird", "first\nSECOND\nthird", 1);
-
   assert.equal(delta.algorithm, "bounded-lcs-line");
   assert.equal(delta.additions, 1);
   assert.equal(delta.deletions, 1);
-  assert.equal(delta.truncated, false);
   assert.deepEqual(
     delta.hunks[0].lines.map(({ type, text }) => [type, text]),
     [
@@ -68,82 +86,60 @@ test("computes a bounded line delta with surrounding context", () => {
       ["context", "third"],
     ],
   );
-});
-
-test("normalizes whitespace-only changes out of meaningful comparison and deltas", () => {
-  const previous = "alpha beta\ngamma";
-  const reformatted = "\talpha   beta\n\n  gamma\n";
-
-  assert.equal(normalizeMeaningfulText(previous), normalizeMeaningfulText(reformatted));
-  const delta = computeMeaningfulLineDelta(previous, reformatted, 2);
-  assert.equal(delta.additions, 0);
-  assert.equal(delta.deletions, 0);
-  assert.deepEqual(delta.hunks, []);
-});
-
-test("uses bounded fallbacks and caps serialized delta payloads", () => {
   const previous = Array.from({ length: 2_000 }, (_, index) => `old-${index}`).join("\n");
   const current = Array.from({ length: 2_000 }, (_, index) => `new-${index}`).join("\n");
-  const coarse = computeLineDelta(previous, current, 5);
-
-  assert.equal(coarse.algorithm, "bounded-line-replacement");
-  assert.equal(coarse.truncated, true);
-  assert.equal(coarse.truncationReason, "lcs-cell-limit");
-  assert.ok(JSON.stringify(coarse).length <= MAX_DELTA_CHARACTERS);
-
-  const manyLines = computeLineDelta("old\n".repeat(100_001), "new\n".repeat(100_001), 5);
-  assert.equal(manyLines.truncated, true);
-  assert.equal(manyLines.truncationReason, "line-count-limit");
-  assert.ok(JSON.stringify(manyLines).length <= MAX_DELTA_CHARACTERS);
-
-  const longLine = computeLineDelta("a".repeat(100_000), "b".repeat(100_000), 5);
-  assert.equal(longLine.truncated, true);
-  assert.ok(JSON.stringify(longLine).length <= MAX_DELTA_CHARACTERS);
+  const bounded = computeLineDelta(previous, current, 5);
+  assert.equal(bounded.truncated, true);
+  assert.ok(JSON.stringify(bounded).length <= MAX_DELTA_CHARACTERS);
 });
 
-test("starts idempotently and pages the in-memory snapshot", async () => {
+test("starts with a versioned baseline and reads exact revision pages", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "0123456789", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-
   const started = await session.startMonitor({
     path: target,
+    prompt: "Review content and grammar.",
     pollIntervalMs: 25,
-    settleMs: 10,
     contextLines: 2,
   });
   assert.equal(started.revision, 0);
-  assert.equal(started.status, "active");
-  assert.equal(started.reused, false);
+  assert.equal(started.saveSequence, 0);
+  assert.equal(started.revisionArtifactId, `revision-${started.monitorId}-0`);
+  assert.equal(started.promptPresent, true);
+  assert.match(started.promptRef, /^prompt-monitor-\d+-[a-f0-9]{16}$/);
+  assert.equal("settleMs" in started, false);
 
-  const reused = await session.startMonitor({
-    path: target,
-    pollIntervalMs: 30,
-    settleMs: 5,
-    contextLines: 1,
-  });
-  assert.equal(reused.monitorId, started.monitorId);
-  assert.equal(reused.reused, true);
-
-  const first = session.readSnapshot({ monitorId: started.monitorId, offset: 0, maxCharacters: 4 });
-  assert.equal(first.content, "0123");
-  assert.deepEqual(first.pagination, {
-    offset: 0,
-    returnedCharacters: 4,
-    totalCharacters: 10,
-    nextOffset: 4,
-    hasMore: true,
-  });
-  const last = session.readSnapshot({
+  const first = session.readRevision({
     monitorId: started.monitorId,
-    offset: first.pagination.nextOffset,
+    revision: 0,
+    offset: 0,
+    maxCharacters: 4,
+  });
+  assert.equal(first.content, "0123");
+  assert.equal(first.contentHash, started.contentHash);
+  assert.equal(first.promptRef, started.promptRef);
+  assert.equal(first.prompt, "Review content and grammar.");
+  assert.equal(first.pagination.nextOffset, 4);
+  const last = session.readRevision({
+    monitorId: started.monitorId,
+    revision: 0,
+    offset: 4,
     maxCharacters: 20,
   });
   assert.equal(last.content, "456789");
   assert.equal(last.pagination.hasMore, false);
-  assert.equal(last.pagination.nextOffset, null);
+
+  const reused = await session.startMonitor({ path: target, pollIntervalMs: 30 });
+  assert.equal(reused.monitorId, started.monitorId);
+  assert.equal(reused.reused, true);
+  assert.equal(reused.pollIntervalMs, 30);
+  await assert.rejects(
+    session.startMonitor({ path: target, prompt: "Use a different focus." }),
+    (error) => error.code === "MONITOR_PROMPT_CONFLICT",
+  );
 });
 
 test("rejects non-files, oversized files, and invalid UTF-8", async () => {
@@ -156,7 +152,6 @@ test("rejects non-files, oversized files, and invalid UTF-8", async () => {
   await writeFile(invalidUtf8, Buffer.from([0xc3, 0x28]));
   const session = new MonitorSession();
   sessions.push(session);
-
   await assert.rejects(() => session.startMonitor({ path: nestedDirectory }), {
     code: "TARGET_NOT_REGULAR_FILE",
   });
@@ -168,354 +163,380 @@ test("rejects non-files, oversized files, and invalid UTF-8", async () => {
   });
 });
 
-test("emits a changed event and advances the snapshot revision", async () => {
+test("detects same-size saves and exposes an immediate refs-only diff artifact", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
-  await writeFile(target, "alpha\nbeta\ngamma", "utf8");
+  await writeFile(target, "cat", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 15 });
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
 
-  await writeFile(target, "alpha\nBETA\ngamma", "utf8");
-  const result = await session.waitForChange({
+  await writeFile(target, "dog", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  assert.equal(saved.event.revision, 1);
+  assert.equal(saved.event.saveSequence, 1);
+  assert.equal(saved.event.metadata.sizeBytes, 3);
+  assert.equal(saved.event.diffArtifactId, `diff-${started.monitorId}-0-1`);
+  assert.equal("content" in saved.event, false);
+
+  const diff = session.readDiffArtifact({
     monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 2_000,
+    diffArtifactId: saved.event.diffArtifactId,
   });
+  assert.match(diff.content, /-cat/);
+  assert.match(diff.content, /\+dog/);
+  assert.equal(diff.fromRevision, 0);
+  assert.equal(diff.revision, 1);
+  assert.equal("lines" in diff.delta.hunks[0], false);
+});
 
-  assert.equal(result.state, "changed");
-  assert.equal(result.event.type, "changed");
-  assert.equal(result.event.revision, 1);
-  assert.equal(result.event.delta.additions, 1);
-  assert.equal(result.event.delta.deletions, 1);
-  assert.equal(result.rebaselineRequired, false);
+test("treats whitespace-only saves as grammar-relevant content revisions", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "alpha beta\ngamma", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+
+  await writeFile(target, "alpha  beta\n\ngamma", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  assert.equal(saved.event.revision, 1);
+  assert.notEqual(saved.event.contentHash, started.contentHash);
   assert.equal(
-    session.readSnapshot({ monitorId: started.monitorId }).content,
-    "alpha\nBETA\ngamma",
+    session.readRevision({ monitorId: started.monitorId, revision: 1 }).content,
+    "alpha  beta\n\ngamma",
   );
-  assert.equal(await readFile(target, "utf8"), "alpha\nBETA\ngamma");
 });
 
-test("does not advance the revision for a metadata-only write", async () => {
+test("same-content saves increment saveSequence without revision, wake-up, or idle reset", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "unchanged", "utf8");
-  const session = new MonitorSession();
+  const session = new MonitorSession({ idleWarningMs: 110, idleStopMs: 190 });
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
+  const startedAt = Date.now();
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
 
+  await delay(50);
   await writeFile(target, "unchanged", "utf8");
-  const result = await session.waitForChange({
+  await waitUntil(
+    () => session.getStatus({ monitorId: started.monitorId }).saveSequence === 1,
+  );
+  const noRevision = await session.waitForSave({
     monitorId: started.monitorId,
     afterRevision: 0,
-    timeoutMs: 250,
+    timeoutMs: 20,
   });
-  assert.equal(result.state, "timeout");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
+  assert.equal(noRevision.state, "timeout");
+  assert.equal(noRevision.revision, 0);
+  const warning = await withDeadline(
+    session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+  assert.equal(warning.state, "idle-warning");
+  assert.ok(Date.now() - startedAt < 165, "same-content save unexpectedly reset idle time");
 });
 
-test("ignores whitespace-only writes and keeps the revision snapshot stable", async () => {
-  const directory = await temporaryDirectory();
-  const target = path.join(directory, "document.md");
-  const baseline = "alpha beta\ngamma";
-  await writeFile(target, baseline, "utf8");
-  const session = new MonitorSession();
-  sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 20 });
-
-  await writeFile(target, "\talpha   beta\n\n gamma\n", "utf8");
-  const result = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 250,
-  });
-
-  assert.equal(result.state, "timeout");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
-  assert.equal(session.readSnapshot({ monitorId: started.monitorId }).content, baseline);
-});
-
-test("coalesces repeated meaningful writes until the quiet window elapses", async () => {
-  const directory = await temporaryDirectory();
-  const target = path.join(directory, "document.md");
-  await writeFile(target, "version zero", "utf8");
-  const session = new MonitorSession();
-  sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 120 });
-
-  await writeFile(target, "version one", "utf8");
-  await delay(70);
-  await writeFile(target, "version two", "utf8");
-  await delay(80);
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
-
-  const result = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 500,
-  });
-  assert.equal(result.state, "changed");
-  assert.equal(result.event.revision, 1);
-  assert.equal(session.readSnapshot({ monitorId: started.monitorId }).content, "version two");
-});
-
-test("returns the latest net delta from the last handled analysis revision", async () => {
-  const directory = await temporaryDirectory();
-  const target = path.join(directory, "document.md");
-  await writeFile(target, "alpha", "utf8");
-  const session = new MonitorSession();
-  sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 15 });
-
-  await writeFile(target, "bravo", "utf8");
-  const first = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 500,
-  });
-  assert.equal(first.event.revision, 1);
-
-  await writeFile(target, "charlie", "utf8");
-  await delay(100);
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 2);
-
-  const accumulated = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 0,
-  });
-  assert.equal(accumulated.event.revision, 2);
-  assert.equal(accumulated.event.previousRevision, 0);
-  assert.equal(accumulated.event.fromRevision, 0);
-  assert.equal(accumulated.event.delta.additions, 1);
-  assert.equal(accumulated.event.delta.deletions, 1);
-  assert.ok(accumulated.event.changedRanges.length > 0);
-  assert.equal("lines" in accumulated.event.delta.hunks[0], false);
-
-  const acknowledged = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 2,
-    timeoutMs: 0,
-  });
-  assert.equal(acknowledged.state, "timeout");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).analysisBaselineRevision, 2);
-
-  await writeFile(target, "delta", "utf8");
-  const next = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 2,
-    timeoutMs: 500,
-  });
-  assert.equal(next.event.previousRevision, 2);
-  assert.equal(next.event.fromRevision, 2);
-  assert.equal(next.event.delta.additions, 1);
-  assert.equal(next.event.delta.deletions, 1);
-});
-
-test("does not redeliver an older revision while a newer meaningful change is settling", async () => {
+test("processes sequential saves without throttling and preserves aggregate diffs", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "zero", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 100 });
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
 
+  const savedAt = Date.now();
   await writeFile(target, "one", "utf8");
-  const first = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 500,
-  });
+  const first = await waitForSaved(session, started.monitorId, 0);
+  assert.ok(Date.now() - savedAt < 500, "save waited for a removed throttle window");
   assert.equal(first.event.revision, 1);
-
   await writeFile(target, "two", "utf8");
-  await delay(40);
-  assert.equal(
-    session.getStatus({ monitorId: started.monitorId }).pendingMeaningfulChange,
-    true,
-  );
-  const latest = await session.waitForChange({
+  const second = await waitForSaved(session, started.monitorId, 1);
+  assert.equal(second.event.revision, 2);
+  assert.equal(second.event.diffArtifactId, `diff-${started.monitorId}-1-2`);
+
+  const aggregate = await session.waitForSave({
     monitorId: started.monitorId,
     afterRevision: 0,
-    timeoutMs: 500,
+    timeoutMs: 0,
   });
-  assert.equal(latest.event.revision, 2);
-  assert.equal(latest.event.previousRevision, 0);
-});
-
-test("emits one idle warning and automatically stops at the idle deadline", async () => {
-  const directory = await temporaryDirectory();
-  const target = path.join(directory, "document.md");
-  await writeFile(target, "content", "utf8");
-  const session = new MonitorSession({ idleWarningMs: 60, idleStopMs: 110 });
-  sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
-
-  const warning = await withDeadline(
-    session.waitForChange({
-      monitorId: started.monitorId,
-      afterRevision: 0,
-    }),
-  );
-  assert.equal(warning.state, "idle-warning");
-  assert.equal(warning.message, IDLE_WARNING_MESSAGE);
-  assert.equal(warning.revision, 0);
-
-  const stopped = await withDeadline(
-    session.waitForChange({
-      monitorId: started.monitorId,
-      afterRevision: 0,
-    }),
-  );
-  assert.equal(stopped.state, "idle-stopped");
-  assert.equal(stopped.reason, "idle-timeout");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).status, "stopped");
-});
-
-test("a meaningful change after the idle warning resets the idle lifecycle", async () => {
-  const directory = await temporaryDirectory();
-  const target = path.join(directory, "document.md");
-  await writeFile(target, "before", "utf8");
-  const session = new MonitorSession({ idleWarningMs: 70, idleStopMs: 130 });
-  sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
-
-  const warning = await withDeadline(
-    session.waitForChange({ monitorId: started.monitorId, afterRevision: 0 }),
-  );
-  assert.equal(warning.state, "idle-warning");
-  await writeFile(target, "after", "utf8");
-  const changed = await session.waitForChange({
+  assert.equal(aggregate.state, "saved");
+  assert.equal(aggregate.event.revision, 2);
+  assert.equal(aggregate.event.diffArtifactId, `diff-${started.monitorId}-0-2`);
+  const aggregateDiff = session.readDiffArtifact({
     monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 500,
+    diffArtifactId: aggregate.event.diffArtifactId,
   });
-  assert.equal(changed.state, "changed");
-
-  const newWarning = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: changed.event.revision,
-    timeoutMs: 500,
-  });
-  assert.equal(newWarning.state, "idle-warning");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).status, "active");
+  assert.match(aggregateDiff.content, /-zero/);
+  assert.match(aggregateDiff.content, /\+two/);
 });
 
-test("whitespace-only writes do not reset the idle clock", async () => {
+test("isolates artifacts per monitor and CAS-rejects stale or mismatched analysis", async () => {
+  const directory = await temporaryDirectory();
+  const firstTarget = path.join(directory, "first.md");
+  const secondTarget = path.join(directory, "second.md");
+  await writeFile(firstTarget, "first", "utf8");
+  await writeFile(secondTarget, "second", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const first = await session.startMonitor({ path: firstTarget, pollIntervalMs: 25 });
+  const second = await session.startMonitor({ path: secondTarget, pollIntervalMs: 25 });
+
+  await writeFile(firstTarget, "FIRST", "utf8");
+  const saved = await waitForSaved(session, first.monitorId, 0);
+  assert.throws(
+    () => session.readDiffArtifact({
+      monitorId: second.monitorId,
+      diffArtifactId: saved.event.diffArtifactId,
+    }),
+    { code: "ARTIFACT_NOT_FOUND" },
+  );
+  assert.throws(
+    () => session.storeFieldAnalysis({
+      monitorId: first.monitorId,
+      revision: 1,
+      contentHash: first.contentHash,
+      sourceArtifactId: saved.event.diffArtifactId,
+      field: "test",
+      analysis: "stale",
+    }),
+    { code: "STALE_REVISION" },
+  );
+  assert.throws(
+    () => session.storeFieldAnalysis({
+      monitorId: first.monitorId,
+      revision: 1,
+      contentHash: saved.event.contentHash,
+      sourceArtifactId: first.revisionArtifactId,
+      field: "test",
+      analysis: "wrong source revision",
+    }),
+    { code: "ARTIFACT_REVISION_MISMATCH" },
+  );
+});
+
+test("versions field and feedback artifacts and supplies published review context", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
-  await writeFile(target, "alpha beta", "utf8");
-  const session = new MonitorSession({ idleWarningMs: 100, idleStopMs: 190 });
+  await writeFile(target, "baseline", "utf8");
+  const session = new MonitorSession();
   sessions.push(session);
-  const startedAt = Date.now();
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 10 });
+  const started = await session.startMonitor({
+    path: target,
+    prompt: "Review both meaning and Korean grammar.",
+    pollIntervalMs: 25,
+  });
 
-  await delay(55);
-  await writeFile(target, "alpha\t beta\n", "utf8");
-  const warning = await withDeadline(
-    session.waitForChange({ monitorId: started.monitorId, afterRevision: 0 }),
+  const baselineField = session.storeFieldAnalysis({
+    monitorId: started.monitorId,
+    revision: 0,
+    contentHash: started.contentHash,
+    sourceArtifactId: started.revisionArtifactId,
+    field: "software architecture",
+    analysis: "Baseline field analysis",
+  });
+  assert.equal(session.readFieldAnalysis({
+    monitorId: started.monitorId,
+    fieldArtifactId: baselineField.fieldArtifactId,
+  }).analysis, "Baseline field analysis");
+  const baselineDraft = session.storeFeedbackDraft({
+    monitorId: started.monitorId,
+    revision: 0,
+    contentHash: started.contentHash,
+    sourceArtifactId: started.revisionArtifactId,
+    fieldArtifactId: baselineField.fieldArtifactId,
+    feedback: "Baseline feedback",
+  });
+  const published = session.markFeedbackPublished({
+    monitorId: started.monitorId,
+    feedbackArtifactId: baselineDraft.feedbackArtifactId,
+    revision: 0,
+    contentHash: started.contentHash,
+    expectedPublishedRevision: -1,
+  });
+  assert.equal(published.publishedRevision, 0);
+  assert.equal(session.markFeedbackPublished({
+    monitorId: started.monitorId,
+    feedbackArtifactId: baselineDraft.feedbackArtifactId,
+    revision: 0,
+    contentHash: started.contentHash,
+    expectedPublishedRevision: -1,
+  }).reused, true);
+
+  await writeFile(target, "next revision", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  const field = session.storeFieldAnalysis({
+    monitorId: started.monitorId,
+    revision: 1,
+    contentHash: saved.event.contentHash,
+    sourceArtifactId: saved.event.diffArtifactId,
+    field: "software architecture",
+    analysis: "The excerpt changes the architecture statement.",
+  });
+  const bundle = session.readReviewBundle({
+    monitorId: started.monitorId,
+    revision: 1,
+    contentHash: saved.event.contentHash,
+    sourceArtifactId: saved.event.diffArtifactId,
+    fieldArtifactId: field.fieldArtifactId,
+  });
+  assert.equal(bundle.prompt, "Review both meaning and Korean grammar.");
+  assert.match(bundle.excerpt.content, /\+next revision/);
+  assert.equal(bundle.fieldAnalysis.analysis, field.analysis);
+  assert.deepEqual(
+    bundle.recentPublishedFeedback.map(({ revision, feedback }) => ({ revision, feedback })),
+    [{ revision: 0, feedback: "Baseline feedback" }],
   );
 
-  assert.equal(warning.state, "idle-warning");
-  assert.ok(Date.now() - startedAt < 145, "whitespace-only activity unexpectedly reset idle time");
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).revision, 0);
+  const draft = session.storeFeedbackDraft({
+    monitorId: started.monitorId,
+    revision: 1,
+    contentHash: saved.event.contentHash,
+    sourceArtifactId: saved.event.diffArtifactId,
+    fieldArtifactId: field.fieldArtifactId,
+    feedback: "Revision one feedback",
+  });
+  assert.equal(session.readFeedbackArtifact({
+    monitorId: started.monitorId,
+    feedbackArtifactId: draft.feedbackArtifactId,
+  }).feedback, "Revision one feedback");
+  assert.throws(() => session.markFeedbackPublished({
+    monitorId: started.monitorId,
+    feedbackArtifactId: draft.feedbackArtifactId,
+    revision: 1,
+    contentHash: saved.event.contentHash,
+    expectedPublishedRevision: -1,
+  }), { code: "PUBLISHED_REVISION_CONFLICT" });
+  assert.equal(session.markFeedbackPublished({
+    monitorId: started.monitorId,
+    feedbackArtifactId: draft.feedbackArtifactId,
+    revision: 1,
+    contentHash: saved.event.contentHash,
+    expectedPublishedRevision: 0,
+  }).publishedRevision, 1);
 });
 
-test("distinguishes atomic replacement from an in-place change", async () => {
+test("rejects publishing a draft after a newer saved revision", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
-  const replacement = path.join(directory, "replacement.md");
+  await writeFile(target, "zero", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  await writeFile(target, "one", "utf8");
+  const first = await waitForSaved(session, started.monitorId, 0);
+  const field = session.storeFieldAnalysis({
+    monitorId: started.monitorId,
+    revision: 1,
+    contentHash: first.event.contentHash,
+    sourceArtifactId: first.event.diffArtifactId,
+    field: "general",
+    analysis: "field result",
+  });
+  const draft = session.storeFeedbackDraft({
+    monitorId: started.monitorId,
+    revision: 1,
+    contentHash: first.event.contentHash,
+    sourceArtifactId: first.event.diffArtifactId,
+    fieldArtifactId: field.fieldArtifactId,
+    feedback: "draft",
+  });
+  await writeFile(target, "two", "utf8");
+  await waitForSaved(session, started.monitorId, 1);
+  assert.throws(() => session.markFeedbackPublished({
+    monitorId: started.monitorId,
+    feedbackArtifactId: draft.feedbackArtifactId,
+    revision: 1,
+    contentHash: first.event.contentHash,
+    expectedPublishedRevision: -1,
+  }), { code: "STALE_REVISION" });
+});
+
+test("survives one missing probe and classifies recreation as a replacement save", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
   await writeFile(target, "before", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 15 });
-
-  await writeFile(replacement, "after", "utf8");
-  await rename(replacement, target);
-  const result = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 2_000,
-  });
-
-  assert.equal(result.state, "changed");
-  assert.equal(result.event.type, "replaced");
-  assert.equal(result.event.revision, 1);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 80 });
+  await unlink(target);
+  await waitUntil(
+    () => session.getStatus({ monitorId: started.monitorId }).missingProbeCount === 1,
+    500,
+  );
+  await writeFile(target, "after", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0, 1_000);
+  assert.equal(saved.event.type, "replaced");
+  assert.equal(saved.event.revision, 1);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).status, "active");
 });
 
-test("emits deletion and stops the monitor", async () => {
+test("confirms deletion after two missing probes and purges session artifacts", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "temporary", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25, settleMs: 15 });
-
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  const waiting = session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 });
   await unlink(target);
-  const result = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 2_000,
+  const deleted = await withDeadline(waiting);
+  assert.equal(deleted.state, "deleted");
+  assert.equal(deleted.reason, "target-deleted");
+  assert.equal(deleted.purged, true);
+  assert.equal(deleted.revisionArtifactId, null);
+  assert.throws(() => session.readRevision({ monitorId: started.monitorId, revision: 0 }), {
+    code: "REVISION_NOT_AVAILABLE",
   });
-
-  assert.equal(result.state, "changed");
-  assert.equal(result.event.type, "deleted");
-  assert.equal(result.event.revision, 1);
-  const status = session.getStatus({ monitorId: started.monitorId });
-  assert.equal(status.status, "stopped");
-  assert.equal(status.reason, "target-deleted");
 });
 
-test("stopping resolves pending waits and future revisions are rejected", async () => {
+test("keeps idle warning/stop and resets idle only for changed content", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
-  await writeFile(target, "content", "utf8");
-  const session = new MonitorSession();
+  await writeFile(target, "before", "utf8");
+  const session = new MonitorSession({ idleWarningMs: 70, idleStopMs: 130 });
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
-
-  assert.throws(
-    () =>
-      session.waitForChange({
-        monitorId: started.monitorId,
-        afterRevision: 1,
-        timeoutMs: 0,
-      }),
-    { code: "REVISION_AHEAD" },
+  const warning = await withDeadline(
+    session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
+  assert.equal(warning.state, "idle-warning");
+  assert.equal(warning.message, IDLE_WARNING_MESSAGE);
 
-  const pending = session.waitForChange({
+  await writeFile(target, "after", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  const secondWarning = await session.waitForSave({
     monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 2_000,
+    afterRevision: saved.event.revision,
+    timeoutMs: 500,
   });
-  session.stopMonitor({ monitorId: started.monitorId });
-  const result = await pending;
-  assert.equal(result.state, "stopped");
-  assert.equal(result.reason, "user-stopped");
+  assert.equal(secondWarning.state, "idle-warning");
+  const stopped = await withDeadline(session.waitForSave({
+    monitorId: started.monitorId,
+    afterRevision: saved.event.revision,
+  }));
+  assert.equal(stopped.state, "idle-stopped");
+  assert.equal(stopped.purged, true);
 });
 
-test("coalesces pruned event history to the latest revision and requires rebaseline", async () => {
+test("explicit stop resolves waits and purges prompt, revisions, and artifacts", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "content", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
-  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
-  const monitor = session.monitors.get(started.monitorId);
-  monitor.revision = 70;
-  monitor.events = Array.from({ length: 64 }, (_, index) => ({
-    type: "changed",
-    monitorId: monitor.id,
-    revision: index + 7,
-  }));
-
-  const result = await session.waitForChange({
-    monitorId: started.monitorId,
-    afterRevision: 0,
-    timeoutMs: 0,
+  const started = await session.startMonitor({
+    path: target,
+    prompt: "sensitive session prompt",
+    pollIntervalMs: 25,
   });
-  assert.equal(result.historyTruncated, true);
-  assert.equal(result.rebaselineRequired, true);
-  assert.equal(result.event.revision, 70);
+  const pending = session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 });
+  const stoppedStatus = session.stopMonitor({ monitorId: started.monitorId });
+  const stoppedWait = await pending;
+  assert.equal(stoppedStatus.status, "stopped");
+  assert.equal(stoppedStatus.purged, true);
+  assert.equal(stoppedStatus.promptPresent, false);
+  assert.equal(stoppedWait.state, "stopped");
+  assert.throws(() => session.readRevision({ monitorId: started.monitorId, revision: 0 }), {
+    code: "REVISION_NOT_AVAILABLE",
+  });
 });

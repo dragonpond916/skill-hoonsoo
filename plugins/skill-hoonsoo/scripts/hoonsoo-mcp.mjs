@@ -20,19 +20,26 @@ export const IDLE_WARNING_MESSAGE =
   "추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.";
 
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
-const DEFAULT_SETTLE_MS = 3_000;
 const READ_RETRY_DELAY_MS = 25;
 const DEFAULT_CONTEXT_LINES = 5;
 const MAX_EVENT_HISTORY = 64;
+const MAX_DIFF_ARTIFACTS = MAX_EVENT_HISTORY * 2;
 const MAX_FINE_DIFF_LINES = 100_000;
 const MAX_LCS_CELLS = 1_000_000;
 const MAX_LCS_OPERATION_LINES = 10_000;
 const MAX_DELTA_LINES = 200;
 const MAX_DELTA_TEXT_CHARACTERS = 12_000;
+const MAX_DELTA_LINE_CHARACTERS = 4_000;
 const READ_CHUNK_BYTES = 64 * 1024;
+const MAX_PROMPT_CHARACTERS = 8_000;
+const MAX_FIELD_CHARACTERS = 500;
+const MAX_ANALYSIS_CHARACTERS = 16_000;
+const MAX_FEEDBACK_CHARACTERS = 24_000;
+const MAX_REVIEW_HISTORY_ITEMS = 10;
+const MAX_REVIEW_HISTORY_CHARACTERS = 24_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const SERVER_NAME = "hoonsoo";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const TOOL_DEFINITIONS = [
@@ -46,8 +53,12 @@ const TOOL_DEFINITIONS = [
       required: ["path"],
       properties: {
         path: { type: "string", description: "Absolute path to the regular file." },
+        prompt: {
+          type: "string",
+          maxLength: MAX_PROMPT_CHARACTERS,
+          description: "Optional combined content-and-grammar review instruction.",
+        },
         pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 2_000 },
-        settleMs: { type: "integer", minimum: 0, maximum: 10_000, default: 3_000 },
         contextLines: { type: "integer", minimum: 0, maximum: 50, default: 5 },
       },
     },
@@ -60,15 +71,16 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "read_snapshot",
+    name: "read_revision",
     description:
-      "Read one bounded page from the monitor's current in-memory snapshot. Use nextOffset until hasMore is false.",
+      "Read one bounded page from an exact in-memory document revision. Revision 0 is the baseline.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["monitorId"],
+      required: ["monitorId", "revision"],
       properties: {
         monitorId: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
         offset: { type: "integer", minimum: 0, default: 0 },
         maxCharacters: {
           type: "integer",
@@ -79,7 +91,7 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Read Hoonsoo snapshot",
+      title: "Read Hoonsoo revision",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -87,9 +99,9 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "wait_for_change",
+    name: "wait_for_save",
     description:
-      "Wait locally until a meaningful content change, the 60-second idle warning, the 90-second idle stop, cancellation, or an optional timeout. Omit timeoutMs to avoid periodic model wake-ups.",
+      "Wait locally until a saved content revision, the 60-second idle warning, the 90-second idle stop, cancellation, or an optional timeout. Same-content saves do not wake this call or reset content-idle time.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -106,8 +118,205 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Wait for Hoonsoo change",
+      title: "Wait for Hoonsoo save",
       readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "read_diff_artifact",
+    description: "Read one bounded page from a versioned in-memory diff excerpt.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId", "diffArtifactId"],
+      properties: {
+        monitorId: { type: "string" },
+        diffArtifactId: { type: "string" },
+        offset: { type: "integer", minimum: 0, default: 0 },
+        maxCharacters: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_SNAPSHOT_CHARACTERS,
+          default: DEFAULT_SNAPSHOT_CHARACTERS,
+        },
+      },
+    },
+    annotations: {
+      title: "Read Hoonsoo diff artifact",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "store_field_analysis",
+    description:
+      "CAS-validate and store FieldChecker's analysis in session memory. The user document is never modified.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "monitorId",
+        "revision",
+        "contentHash",
+        "sourceArtifactId",
+        "field",
+        "analysis",
+      ],
+      properties: {
+        monitorId: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
+        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        sourceArtifactId: { type: "string" },
+        field: { type: "string", minLength: 1, maxLength: MAX_FIELD_CHARACTERS },
+        analysis: { type: "string", minLength: 1, maxLength: MAX_ANALYSIS_CHARACTERS },
+      },
+    },
+    annotations: {
+      title: "Store Hoonsoo field analysis",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "read_field_analysis",
+    description: "Read one exact versioned FieldChecker artifact from session memory.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId", "fieldArtifactId"],
+      properties: {
+        monitorId: { type: "string" },
+        fieldArtifactId: { type: "string" },
+      },
+    },
+    annotations: {
+      title: "Read Hoonsoo field analysis",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "read_review_bundle",
+    description:
+      "CAS-validate and assemble the prompt, FieldChecker result, current excerpt, and recent published feedback for Main Agent.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "monitorId",
+        "revision",
+        "contentHash",
+        "sourceArtifactId",
+        "fieldArtifactId",
+      ],
+      properties: {
+        monitorId: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
+        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        sourceArtifactId: { type: "string" },
+        fieldArtifactId: { type: "string" },
+        feedbackLimit: {
+          type: "integer",
+          minimum: 0,
+          maximum: MAX_REVIEW_HISTORY_ITEMS,
+          default: 3,
+        },
+      },
+    },
+    annotations: {
+      title: "Read Hoonsoo review bundle",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "store_feedback_draft",
+    description:
+      "CAS-validate and store Main Agent's feedback draft in session memory. The user document is never modified.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "monitorId",
+        "revision",
+        "contentHash",
+        "sourceArtifactId",
+        "fieldArtifactId",
+        "feedback",
+      ],
+      properties: {
+        monitorId: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
+        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        sourceArtifactId: { type: "string" },
+        fieldArtifactId: { type: "string" },
+        feedback: { type: "string", minLength: 1, maxLength: MAX_FEEDBACK_CHARACTERS },
+      },
+    },
+    annotations: {
+      title: "Store Hoonsoo feedback draft",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "read_feedback_artifact",
+    description: "Read one exact versioned feedback draft or published feedback artifact.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId", "feedbackArtifactId"],
+      properties: {
+        monitorId: { type: "string" },
+        feedbackArtifactId: { type: "string" },
+      },
+    },
+    annotations: {
+      title: "Read Hoonsoo feedback artifact",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "mark_feedback_published",
+    description:
+      "CAS-mark one feedback artifact as published and advance publishedRevision in session memory.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "monitorId",
+        "feedbackArtifactId",
+        "revision",
+        "contentHash",
+        "expectedPublishedRevision",
+      ],
+      properties: {
+        monitorId: { type: "string" },
+        feedbackArtifactId: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
+        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        expectedPublishedRevision: { type: "integer", minimum: -1 },
+      },
+    },
+    annotations: {
+      title: "Publish Hoonsoo feedback",
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
@@ -223,6 +432,7 @@ function publicMetadata(metadata) {
   return {
     sizeBytes: metadata.size,
     modifiedTimeNanoseconds: metadata.mtimeNs,
+    changedTimeNanoseconds: metadata.ctimeNs,
     device: metadata.dev,
     inode: metadata.ino,
   };
@@ -319,7 +529,7 @@ async function readPathOnce(targetPath) {
   }
 }
 
-async function readStablePath(targetPath, settleMs, attempts = 3) {
+async function readStablePath(targetPath, retryDelayMs, attempts = 3) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
@@ -327,7 +537,7 @@ async function readStablePath(targetPath, settleMs, attempts = 3) {
     } catch (error) {
       lastError = error;
       if (error.code !== "TARGET_CHANGED_DURING_READ" || attempt === attempts - 1) throw error;
-      await sleep(settleMs);
+      await sleep(retryDelayMs);
     }
   }
   throw lastError;
@@ -342,12 +552,8 @@ function countLines(text) {
   return count;
 }
 
-export function normalizeMeaningfulText(text) {
-  return text.replace(/\s/gu, "");
-}
-
-function semanticHash(text) {
-  return createHash("sha256").update(normalizeMeaningfulText(text), "utf8").digest("hex");
+export function computeContentHash(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 function operation(type, oldLine, newLine, text) {
@@ -497,30 +703,36 @@ function truncateDelta(delta) {
   let includedTextCharacters = 0;
   let truncated = delta.truncated;
   const hunks = [];
+  let exhausted = false;
 
-  outer: for (const hunk of delta.hunks) {
+  for (const hunk of delta.hunks) {
     const lines = [];
     for (const line of hunk.lines) {
       if (includedLines >= MAX_DELTA_LINES) {
         truncated = true;
-        break outer;
+        exhausted = true;
+        break;
       }
       const remaining = MAX_DELTA_TEXT_CHARACTERS - includedTextCharacters;
       if (remaining <= 0) {
         truncated = true;
-        break outer;
+        exhausted = true;
+        break;
       }
       let text = line.text;
-      if (text.length > remaining) {
-        text = `${text.slice(0, Math.max(0, remaining - 1))}…`;
+      const lineLimit = Math.min(remaining, MAX_DELTA_LINE_CHARACTERS);
+      if (text.length > lineLimit) {
+        const headLength = Math.max(0, Math.floor((lineLimit - 1) / 2));
+        const tailLength = Math.max(0, lineLimit - headLength - 1);
+        text = `${text.slice(0, headLength)}…${text.slice(text.length - tailLength)}`;
         truncated = true;
       }
       lines.push({ ...line, text });
       includedLines += 1;
       includedTextCharacters += text.length;
-      if (text.length !== line.text.length) break outer;
     }
     if (lines.length > 0) hunks.push({ ...hunk, lines });
+    if (exhausted) break;
   }
 
   const bounded = {
@@ -670,42 +882,23 @@ export function computeLineDelta(previousText, currentText, contextLines = DEFAU
   });
 }
 
-export function computeMeaningfulLineDelta(
-  previousText,
-  currentText,
-  contextLines = DEFAULT_CONTEXT_LINES,
-) {
-  if (semanticHash(previousText) === semanticHash(currentText)) {
-    return computeLineDelta(previousText, previousText, contextLines);
-  }
-
-  const delta = computeLineDelta(previousText, currentText, contextLines);
-  const hunks = delta.hunks.filter((hunk) => {
-    const deleted = hunk.lines
-      .filter((line) => line.type === "delete")
-      .map((line) => line.text)
-      .join("\n");
-    const added = hunk.lines
-      .filter((line) => line.type === "add")
-      .map((line) => line.text)
-      .join("\n");
-    return normalizeMeaningfulText(deleted) !== normalizeMeaningfulText(added);
-  });
-  const retainedLines = hunks.flatMap((hunk) => hunk.lines);
-  return {
-    ...delta,
-    hunks,
-    additions: retainedLines.filter((line) => line.type === "add").length,
-    deletions: retainedLines.filter((line) => line.type === "delete").length,
-    includedLineOperations: retainedLines.length,
-  };
-}
-
 function changedRanges(delta) {
   return delta.hunks.map((hunk) => ({
     startLine: hunk.newStart,
     endLine: Math.max(hunk.newStart, hunk.newStart + Math.max(0, hunk.newCount - 1)),
   }));
+}
+
+function formatDiffExcerpt(delta) {
+  const lines = [];
+  for (const hunk of delta.hunks) {
+    lines.push(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
+    for (const line of hunk.lines) {
+      const prefix = line.type === "add" ? "+" : line.type === "delete" ? "-" : " ";
+      lines.push(`${prefix}${line.text}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function deltaReference(delta) {
@@ -787,6 +980,12 @@ export class MonitorSession {
   async startMonitor(input) {
     const args = assertObject(input);
     const targetPath = normalizeTargetPath(args.path);
+    const prompt = this.#boundedString(
+      args.prompt ?? "",
+      "prompt",
+      MAX_PROMPT_CHARACTERS,
+      true,
+    );
     const pollIntervalMs = integerOption(
       args.pollIntervalMs,
       "pollIntervalMs",
@@ -794,7 +993,6 @@ export class MonitorSession {
       25,
       60_000,
     );
-    const settleMs = integerOption(args.settleMs, "settleMs", DEFAULT_SETTLE_MS, 0, 10_000);
     const contextLines = integerOption(
       args.contextLines,
       "contextLines",
@@ -806,49 +1004,64 @@ export class MonitorSession {
     const activeId = this.activeByPath.get(targetPath);
     const active = activeId ? this.monitors.get(activeId) : undefined;
     if (active?.status === "active") {
+      if (args.prompt !== undefined && prompt !== active.prompt) {
+        throw new HoonsooError(
+          "MONITOR_PROMPT_CONFLICT",
+          "An active monitor keeps one immutable invocation prompt. Stop it before starting the same target with a different prompt.",
+        );
+      }
       active.pollIntervalMs = pollIntervalMs;
-      active.settleMs = settleMs;
       active.contextLines = contextLines;
       this.#restartPollTimer(active);
       return { ...this.#status(active), reused: true };
     }
 
     const snapshot = await readStablePath(targetPath, READ_RETRY_DELAY_MS);
-    const snapshotHash = semanticHash(snapshot.text);
     const startedAtMs = this.now();
+    const monitorId = "monitor-" + this.nextMonitorNumber++;
+    const promptHash = computeContentHash(prompt);
     const monitor = {
-      id: `monitor-${this.nextMonitorNumber++}`,
+      id: monitorId,
       path: targetPath,
+      prompt,
+      promptHash,
+      promptRef: "prompt-" + monitorId + "-" + promptHash.slice(0, 16),
       status: "active",
       reason: null,
       error: null,
+      purged: false,
       revision: 0,
+      saveSequence: 0,
+      publishedRevision: -1,
       observedSnapshot: snapshot,
-      observedSemanticHash: snapshotHash,
-      revisionSnapshot: snapshot,
-      revisionSemanticHash: snapshotHash,
-      analysisBaselineRevision: 0,
-      analysisBaselineSnapshot: snapshot,
-      revisionSnapshots: new Map([[0, snapshot]]),
+      currentContentHash: computeContentHash(snapshot.text),
+      revisionArtifacts: new Map(),
+      revisionArtifactsById: new Map(),
+      diffArtifacts: new Map(),
+      diffArtifactsByRange: new Map(),
+      fieldArtifacts: new Map(),
+      fieldArtifactByRevision: new Map(),
+      feedbackArtifacts: new Map(),
+      feedbackArtifactByRevision: new Map(),
+      publishedFeedbackIds: [],
+      saveRecords: [],
       pollIntervalMs,
-      settleMs,
       contextLines,
       startedAt: new Date(startedAtMs).toISOString(),
       lastEventAt: null,
-      lastMeaningfulActivityAtMs: startedAtMs,
+      lastSaveAt: null,
+      lastContentActivityAtMs: startedAtMs,
       idleWarningIssued: false,
       idleWarningPending: false,
       idleWarningDelivered: false,
       events: [],
       waiters: new Set(),
       pollTimer: null,
-      settleTimer: null,
       idleTimer: null,
-      pendingKey: null,
-      pendingMeaningfulChange: false,
       polling: false,
-      settling: false,
+      missingProbes: 0,
     };
+    this.#storeRevisionArtifact(monitor, 0, snapshot);
     this.monitors.set(monitor.id, monitor);
     this.activeByPath.set(targetPath, monitor.id);
     this.#restartPollTimer(monitor);
@@ -856,9 +1069,16 @@ export class MonitorSession {
     return { ...this.#status(monitor), reused: false };
   }
 
-  readSnapshot(input) {
+  readRevision(input) {
     const args = assertObject(input);
     const monitor = this.#requireMonitor(args.monitorId);
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     const offset = integerOption(args.offset, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
     const maxCharacters = integerOption(
       args.maxCharacters,
@@ -867,18 +1087,21 @@ export class MonitorSession {
       1,
       MAX_SNAPSHOT_CHARACTERS,
     );
+    const artifact = this.#requireRevisionArtifact(monitor, revision);
     return {
       monitorId: monitor.id,
       path: monitor.path,
-      revision: monitor.revision,
-      status: monitor.status,
-      semanticHash: monitor.revisionSemanticHash,
-      metadata: publicMetadata(monitor.revisionSnapshot.metadata),
-      ...pageText(monitor.revisionSnapshot.text, offset, maxCharacters),
+      revision,
+      revisionArtifactId: artifact.id,
+      contentHash: artifact.contentHash,
+      promptRef: monitor.promptRef,
+      prompt: monitor.prompt,
+      metadata: publicMetadata(artifact.snapshot.metadata),
+      ...pageText(artifact.snapshot.text, offset, maxCharacters),
     };
   }
 
-  waitForChange(input, signal = undefined) {
+  waitForSave(input, signal = undefined) {
     const args = assertObject(input);
     const monitor = this.#requireMonitor(args.monitorId);
     const afterRevision = integerOption(
@@ -895,26 +1118,27 @@ export class MonitorSession {
     if (afterRevision > monitor.revision) {
       throw new HoonsooError(
         "REVISION_AHEAD",
-        `afterRevision ${afterRevision} is ahead of current revision ${monitor.revision}. Re-read status or snapshot before waiting.`,
+        "afterRevision " +
+          afterRevision +
+          " is ahead of current revision " +
+          monitor.revision +
+          ".",
       );
     }
-    this.#acknowledgeHandledRevision(monitor, afterRevision);
-    let event;
-    for (let index = monitor.events.length - 1; index >= 0; index -= 1) {
-      if (monitor.events[index].revision > afterRevision) {
-        event = monitor.events[index];
-        break;
-      }
-    }
-    if (event && !monitor.pendingMeaningfulChange) {
-      return Promise.resolve(this.#eventResult(monitor, event, afterRevision));
+    if (monitor.status === "active" && monitor.revision > afterRevision) {
+      return Promise.resolve(this.#saveResult(monitor, afterRevision));
     }
     if (monitor.status === "error") {
       return Promise.resolve({ state: "error", ...this.#status(monitor) });
     }
     if (monitor.status !== "active") {
       return Promise.resolve({
-        state: monitor.reason === "idle-timeout" ? "idle-stopped" : "stopped",
+        state:
+          monitor.reason === "idle-timeout"
+            ? "idle-stopped"
+            : monitor.reason === "target-deleted"
+              ? "deleted"
+              : "stopped",
         ...this.#status(monitor),
       });
     }
@@ -928,6 +1152,7 @@ export class MonitorSession {
         state: "timeout",
         monitorId: monitor.id,
         revision: monitor.revision,
+        saveSequence: monitor.saveSequence,
         status: monitor.status,
       });
     }
@@ -946,6 +1171,7 @@ export class MonitorSession {
             state: "cancelled",
             monitorId: monitor.id,
             revision: monitor.revision,
+            saveSequence: monitor.saveSequence,
             status: monitor.status,
           });
         },
@@ -957,6 +1183,7 @@ export class MonitorSession {
             state: "timeout",
             monitorId: monitor.id,
             revision: monitor.revision,
+            saveSequence: monitor.saveSequence,
             status: monitor.status,
           });
         }, timeoutMs);
@@ -965,6 +1192,313 @@ export class MonitorSession {
       signal?.addEventListener("abort", waiter.abort, { once: true });
       if (signal?.aborted) waiter.abort();
     });
+  }
+
+  readDiffArtifact(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const diffArtifactId = requireString(args.diffArtifactId, "diffArtifactId");
+    const offset = integerOption(args.offset, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
+    const maxCharacters = integerOption(
+      args.maxCharacters,
+      "maxCharacters",
+      DEFAULT_SNAPSHOT_CHARACTERS,
+      1,
+      MAX_SNAPSHOT_CHARACTERS,
+    );
+    const artifact = this.#requireDiffArtifact(monitor, diffArtifactId);
+    return {
+      monitorId: monitor.id,
+      diffArtifactId: artifact.id,
+      fromRevision: artifact.fromRevision,
+      revision: artifact.revision,
+      fromContentHash: artifact.fromContentHash,
+      contentHash: artifact.contentHash,
+      promptRef: monitor.promptRef,
+      prompt: monitor.prompt,
+      changedRanges: artifact.changedRanges,
+      delta: artifact.delta,
+      ...pageText(artifact.excerpt, offset, maxCharacters),
+    };
+  }
+
+  storeFieldAnalysis(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const contentHash = requireString(args.contentHash, "contentHash");
+    const sourceArtifactId = requireString(args.sourceArtifactId, "sourceArtifactId");
+    const field = this.#boundedString(args.field, "field", MAX_FIELD_CHARACTERS);
+    const analysis = this.#boundedString(
+      args.analysis,
+      "analysis",
+      MAX_ANALYSIS_CHARACTERS,
+    );
+    this.#assertCurrentRevision(monitor, revision, contentHash);
+    this.#requireSourceArtifact(monitor, sourceArtifactId, revision, contentHash);
+
+    const existingId = monitor.fieldArtifactByRevision.get(revision);
+    if (existingId) {
+      const existing = monitor.fieldArtifacts.get(existingId);
+      if (
+        existing.contentHash === contentHash &&
+        existing.sourceArtifactId === sourceArtifactId &&
+        existing.field === field &&
+        existing.analysis === analysis
+      ) {
+        return { ...this.#publicFieldArtifact(existing), reused: true };
+      }
+      throw new HoonsooError(
+        "FIELD_ANALYSIS_CONFLICT",
+        "A different FieldChecker artifact already exists for revision " + revision + ".",
+      );
+    }
+
+    const artifact = {
+      id: "field-" + monitor.id + "-" + revision,
+      revision,
+      contentHash,
+      sourceArtifactId,
+      field,
+      analysis,
+      createdAt: new Date(this.now()).toISOString(),
+    };
+    monitor.fieldArtifacts.set(artifact.id, artifact);
+    monitor.fieldArtifactByRevision.set(revision, artifact.id);
+    return { ...this.#publicFieldArtifact(artifact), reused: false };
+  }
+
+  readFieldAnalysis(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const artifact = this.#requireFieldArtifact(
+      monitor,
+      requireString(args.fieldArtifactId, "fieldArtifactId"),
+    );
+    return this.#publicFieldArtifact(artifact);
+  }
+
+  readReviewBundle(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const contentHash = requireString(args.contentHash, "contentHash");
+    const sourceArtifactId = requireString(args.sourceArtifactId, "sourceArtifactId");
+    const fieldArtifactId = requireString(args.fieldArtifactId, "fieldArtifactId");
+    const feedbackLimit = integerOption(
+      args.feedbackLimit,
+      "feedbackLimit",
+      3,
+      0,
+      MAX_REVIEW_HISTORY_ITEMS,
+    );
+    this.#assertCurrentRevision(monitor, revision, contentHash);
+    const source = this.#requireSourceArtifact(
+      monitor,
+      sourceArtifactId,
+      revision,
+      contentHash,
+    );
+    const fieldArtifact = this.#requireFieldArtifact(monitor, fieldArtifactId);
+    this.#assertFieldMatches(
+      fieldArtifact,
+      revision,
+      contentHash,
+      sourceArtifactId,
+    );
+
+    const excerpt =
+      source.kind === "diff"
+        ? {
+            content: source.artifact.excerpt,
+            truncated: source.artifact.delta.truncated,
+            changedRanges: source.artifact.changedRanges,
+          }
+        : {
+            content: source.artifact.snapshot.text.slice(0, MAX_DELTA_TEXT_CHARACTERS),
+            truncated: source.artifact.snapshot.text.length > MAX_DELTA_TEXT_CHARACTERS,
+            changedRanges: [
+              {
+                startLine: 1,
+                endLine: Math.max(1, countLines(source.artifact.snapshot.text)),
+              },
+            ],
+          };
+
+    const recentPublishedFeedback = [];
+    let remainingCharacters = MAX_REVIEW_HISTORY_CHARACTERS;
+    const candidateIds = monitor.publishedFeedbackIds.slice(-feedbackLimit);
+    for (let index = candidateIds.length - 1; index >= 0; index -= 1) {
+      const artifact = monitor.feedbackArtifacts.get(candidateIds[index]);
+      if (!artifact || artifact.revision >= revision || remainingCharacters <= 0) continue;
+      const feedback =
+        artifact.feedback.length <= remainingCharacters
+          ? artifact.feedback
+          : artifact.feedback.slice(artifact.feedback.length - remainingCharacters);
+      remainingCharacters -= feedback.length;
+      recentPublishedFeedback.unshift({
+        feedbackArtifactId: artifact.id,
+        revision: artifact.revision,
+        feedback,
+        publishedAt: artifact.publishedAt,
+      });
+    }
+
+    return {
+      monitorId: monitor.id,
+      revision,
+      contentHash,
+      promptRef: monitor.promptRef,
+      prompt: monitor.prompt,
+      sourceArtifactId,
+      sourceKind: source.kind,
+      excerpt,
+      fieldAnalysis: this.#publicFieldArtifact(fieldArtifact),
+      recentPublishedFeedback,
+      publishedRevision: monitor.publishedRevision,
+    };
+  }
+
+  storeFeedbackDraft(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const contentHash = requireString(args.contentHash, "contentHash");
+    const sourceArtifactId = requireString(args.sourceArtifactId, "sourceArtifactId");
+    const fieldArtifactId = requireString(args.fieldArtifactId, "fieldArtifactId");
+    const feedback = this.#boundedString(
+      args.feedback,
+      "feedback",
+      MAX_FEEDBACK_CHARACTERS,
+    );
+    this.#assertCurrentRevision(monitor, revision, contentHash);
+    this.#requireSourceArtifact(monitor, sourceArtifactId, revision, contentHash);
+    const fieldArtifact = this.#requireFieldArtifact(monitor, fieldArtifactId);
+    this.#assertFieldMatches(
+      fieldArtifact,
+      revision,
+      contentHash,
+      sourceArtifactId,
+    );
+
+    const existingId = monitor.feedbackArtifactByRevision.get(revision);
+    if (existingId) {
+      const existing = monitor.feedbackArtifacts.get(existingId);
+      if (
+        existing.contentHash === contentHash &&
+        existing.sourceArtifactId === sourceArtifactId &&
+        existing.fieldArtifactId === fieldArtifactId &&
+        existing.feedback === feedback
+      ) {
+        return { ...this.#publicFeedbackArtifact(existing), reused: true };
+      }
+      throw new HoonsooError(
+        "FEEDBACK_DRAFT_CONFLICT",
+        "A different feedback artifact already exists for revision " + revision + ".",
+      );
+    }
+
+    const artifact = {
+      id: "feedback-" + monitor.id + "-" + revision,
+      revision,
+      contentHash,
+      sourceArtifactId,
+      fieldArtifactId,
+      feedback,
+      state: "draft",
+      createdAt: new Date(this.now()).toISOString(),
+      publishedAt: null,
+    };
+    monitor.feedbackArtifacts.set(artifact.id, artifact);
+    monitor.feedbackArtifactByRevision.set(revision, artifact.id);
+    return { ...this.#publicFeedbackArtifact(artifact), reused: false };
+  }
+
+  readFeedbackArtifact(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const artifact = this.#requireFeedbackArtifact(
+      monitor,
+      requireString(args.feedbackArtifactId, "feedbackArtifactId"),
+    );
+    return this.#publicFeedbackArtifact(artifact);
+  }
+
+  markFeedbackPublished(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const feedbackArtifactId = requireString(
+      args.feedbackArtifactId,
+      "feedbackArtifactId",
+    );
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const contentHash = requireString(args.contentHash, "contentHash");
+    const expectedPublishedRevision = integerOption(
+      args.expectedPublishedRevision,
+      "expectedPublishedRevision",
+      undefined,
+      -1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    this.#assertCurrentRevision(monitor, revision, contentHash);
+    const artifact = this.#requireFeedbackArtifact(monitor, feedbackArtifactId);
+    if (artifact.revision !== revision || artifact.contentHash !== contentHash) {
+      throw new HoonsooError(
+        "ARTIFACT_REVISION_MISMATCH",
+        "Feedback artifact does not match the requested revision and content hash.",
+      );
+    }
+    if (artifact.state === "published") {
+      return {
+        ...this.#publicFeedbackArtifact(artifact),
+        publishedRevision: monitor.publishedRevision,
+        reused: true,
+      };
+    }
+    if (monitor.publishedRevision !== expectedPublishedRevision) {
+      throw new HoonsooError(
+        "PUBLISHED_REVISION_CONFLICT",
+        "Expected publishedRevision " +
+          expectedPublishedRevision +
+          " but found " +
+          monitor.publishedRevision +
+          ".",
+      );
+    }
+
+    artifact.state = "published";
+    artifact.publishedAt = new Date(this.now()).toISOString();
+    monitor.publishedRevision = revision;
+    monitor.publishedFeedbackIds.push(artifact.id);
+    return {
+      ...this.#publicFeedbackArtifact(artifact),
+      publishedRevision: monitor.publishedRevision,
+      reused: false,
+    };
   }
 
   getStatus(input = {}) {
@@ -985,78 +1519,276 @@ export class MonitorSession {
     this.closed = true;
     for (const monitor of this.monitors.values()) {
       if (monitor.status === "active") this.#stop(monitor, "session-ended", "stopped");
+      else this.#purge(monitor);
     }
+    this.activeByPath.clear();
+  }
+
+  #boundedString(value, name, maximum, allowEmpty = false) {
+    if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
+      throw new HoonsooError(
+        "INVALID_ARGUMENT",
+        name + " must be " + (allowEmpty ? "a string" : "a non-empty string") + ".",
+      );
+    }
+    if (value.length > maximum) {
+      throw new HoonsooError(
+        "INVALID_ARGUMENT",
+        name + " must not exceed " + maximum + " characters.",
+      );
+    }
+    return value;
   }
 
   #requireMonitor(monitorId) {
     requireString(monitorId, "monitorId");
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) throw new HoonsooError("MONITOR_NOT_FOUND", `Unknown monitorId: ${monitorId}`);
+    if (!monitor) throw new HoonsooError("MONITOR_NOT_FOUND", "Unknown monitorId: " + monitorId);
     return monitor;
   }
 
+  #requireRevisionArtifact(monitor, revision) {
+    const artifact = monitor.revisionArtifacts.get(revision);
+    if (!artifact) {
+      throw new HoonsooError(
+        "REVISION_NOT_AVAILABLE",
+        "Revision " + revision + " is unavailable or has been purged.",
+      );
+    }
+    return artifact;
+  }
+
+  #requireDiffArtifact(monitor, artifactId) {
+    const artifact = monitor.diffArtifacts.get(artifactId);
+    if (!artifact) {
+      throw new HoonsooError(
+        "ARTIFACT_NOT_FOUND",
+        "Unknown diffArtifactId for this monitor: " + artifactId,
+      );
+    }
+    return artifact;
+  }
+
+  #requireFieldArtifact(monitor, artifactId) {
+    const artifact = monitor.fieldArtifacts.get(artifactId);
+    if (!artifact) {
+      throw new HoonsooError(
+        "ARTIFACT_NOT_FOUND",
+        "Unknown fieldArtifactId for this monitor: " + artifactId,
+      );
+    }
+    return artifact;
+  }
+
+  #requireFeedbackArtifact(monitor, artifactId) {
+    const artifact = monitor.feedbackArtifacts.get(artifactId);
+    if (!artifact) {
+      throw new HoonsooError(
+        "ARTIFACT_NOT_FOUND",
+        "Unknown feedbackArtifactId for this monitor: " + artifactId,
+      );
+    }
+    return artifact;
+  }
+
+  #assertCurrentRevision(monitor, revision, contentHash) {
+    if (monitor.status !== "active") {
+      throw new HoonsooError(
+        "MONITOR_NOT_ACTIVE",
+        "Monitor is not active: " + monitor.id,
+      );
+    }
+    const current = this.#requireRevisionArtifact(monitor, monitor.revision);
+    if (
+      revision !== monitor.revision ||
+      contentHash !== monitor.currentContentHash ||
+      contentHash !== current.contentHash
+    ) {
+      throw new HoonsooError(
+        "STALE_REVISION",
+        "Expected current revision " +
+          monitor.revision +
+          " with contentHash " +
+          monitor.currentContentHash +
+          ".",
+      );
+    }
+    return current;
+  }
+
+  #requireSourceArtifact(monitor, artifactId, revision, contentHash) {
+    const revisionArtifact = monitor.revisionArtifactsById.get(artifactId);
+    if (revisionArtifact) {
+      if (
+        revisionArtifact.revision !== revision ||
+        revisionArtifact.contentHash !== contentHash
+      ) {
+        throw new HoonsooError(
+          "ARTIFACT_REVISION_MISMATCH",
+          "Revision artifact does not match the requested CAS values.",
+        );
+      }
+      return { kind: "revision", artifact: revisionArtifact };
+    }
+    const diffArtifact = monitor.diffArtifacts.get(artifactId);
+    if (diffArtifact) {
+      if (
+        diffArtifact.revision !== revision ||
+        diffArtifact.contentHash !== contentHash
+      ) {
+        throw new HoonsooError(
+          "ARTIFACT_REVISION_MISMATCH",
+          "Diff artifact does not match the requested CAS values.",
+        );
+      }
+      return { kind: "diff", artifact: diffArtifact };
+    }
+    throw new HoonsooError(
+      "ARTIFACT_NOT_FOUND",
+      "Unknown sourceArtifactId for this monitor: " + artifactId,
+    );
+  }
+
+  #assertFieldMatches(fieldArtifact, revision, contentHash, sourceArtifactId) {
+    if (
+      fieldArtifact.revision !== revision ||
+      fieldArtifact.contentHash !== contentHash ||
+      fieldArtifact.sourceArtifactId !== sourceArtifactId
+    ) {
+      throw new HoonsooError(
+        "ARTIFACT_REVISION_MISMATCH",
+        "Field artifact does not match the requested revision, hash, and source.",
+      );
+    }
+  }
+
+  #publicFieldArtifact(artifact) {
+    return {
+      fieldArtifactId: artifact.id,
+      revision: artifact.revision,
+      contentHash: artifact.contentHash,
+      sourceArtifactId: artifact.sourceArtifactId,
+      field: artifact.field,
+      analysis: artifact.analysis,
+      createdAt: artifact.createdAt,
+    };
+  }
+
+  #publicFeedbackArtifact(artifact) {
+    return {
+      feedbackArtifactId: artifact.id,
+      revision: artifact.revision,
+      contentHash: artifact.contentHash,
+      sourceArtifactId: artifact.sourceArtifactId,
+      fieldArtifactId: artifact.fieldArtifactId,
+      feedback: artifact.feedback,
+      state: artifact.state,
+      createdAt: artifact.createdAt,
+      publishedAt: artifact.publishedAt,
+    };
+  }
+
   #status(monitor) {
+    const current = monitor.revisionArtifacts.get(monitor.revision);
     return {
       monitorId: monitor.id,
       path: monitor.path,
       status: monitor.status,
       reason: monitor.reason,
       error: monitor.error,
+      purged: monitor.purged,
       revision: monitor.revision,
-      semanticHash: monitor.revisionSemanticHash,
-      metadata: publicMetadata(monitor.revisionSnapshot.metadata),
-      observedMetadata: publicMetadata(monitor.observedSnapshot.metadata),
+      revisionArtifactId: current?.id ?? null,
+      contentHash: monitor.purged ? null : monitor.currentContentHash,
+      metadata: monitor.purged ? null : publicMetadata(monitor.observedSnapshot?.metadata),
+      saveSequence: monitor.saveSequence,
       pollIntervalMs: monitor.pollIntervalMs,
-      settleMs: monitor.settleMs,
       contextLines: monitor.contextLines,
       startedAt: monitor.startedAt,
       lastEventAt: monitor.lastEventAt,
-      analysisBaselineRevision: monitor.analysisBaselineRevision,
-      pendingMeaningfulChange: monitor.pendingMeaningfulChange,
+      lastSaveAt: monitor.lastSaveAt,
+      publishedRevision: monitor.publishedRevision,
+      missingProbeCount: monitor.missingProbes,
+      promptPresent: !monitor.purged && monitor.prompt.length > 0,
+      promptRef: monitor.purged ? null : monitor.promptRef,
       idleWarningIssued: monitor.idleWarningIssued,
-      idleForMs: Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs),
+      idleForMs: Math.max(0, this.now() - monitor.lastContentActivityAtMs),
     };
   }
 
-  #acknowledgeHandledRevision(monitor, revision) {
-    if (revision <= monitor.analysisBaselineRevision) return;
-    const snapshot =
-      monitor.revisionSnapshots.get(revision) ??
-      (revision === monitor.revision ? monitor.revisionSnapshot : undefined);
-    if (!snapshot) return;
-    monitor.analysisBaselineRevision = revision;
-    monitor.analysisBaselineSnapshot = snapshot;
+  #storeRevisionArtifact(monitor, revision, snapshot) {
+    const artifact = {
+      id: "revision-" + monitor.id + "-" + revision,
+      revision,
+      contentHash: computeContentHash(snapshot.text),
+      snapshot,
+      createdAt: new Date(this.now()).toISOString(),
+    };
+    monitor.revisionArtifacts.set(revision, artifact);
+    monitor.revisionArtifactsById.set(artifact.id, artifact);
+    return artifact;
   }
 
-  #eventResult(monitor, event, afterRevision) {
-    const snapshot =
-      monitor.revisionSnapshots.get(event.revision) ??
-      (event.revision === monitor.revision ? monitor.revisionSnapshot : undefined);
-    if (!snapshot) {
-      return {
-        state: "changed",
-        historyTruncated: true,
-        rebaselineRequired: true,
-        event: { ...event, delta: null, changedRanges: [] },
-      };
-    }
-    const delta = computeMeaningfulLineDelta(
-      monitor.analysisBaselineSnapshot.text,
-      snapshot.text,
+  #createDiffArtifact(monitor, fromRevision, revision) {
+    const rangeKey = fromRevision + ":" + revision;
+    const existingId = monitor.diffArtifactsByRange.get(rangeKey);
+    if (existingId) return this.#requireDiffArtifact(monitor, existingId);
+    const previous = this.#requireRevisionArtifact(monitor, fromRevision);
+    const current = this.#requireRevisionArtifact(monitor, revision);
+    const delta = computeLineDelta(
+      previous.snapshot.text,
+      current.snapshot.text,
       monitor.contextLines,
     );
-    const historyTruncated = monitor.events[0]?.revision > afterRevision + 1;
+    const artifact = {
+      id: "diff-" + monitor.id + "-" + fromRevision + "-" + revision,
+      fromRevision,
+      revision,
+      fromContentHash: previous.contentHash,
+      contentHash: current.contentHash,
+      excerpt: formatDiffExcerpt(delta),
+      changedRanges: changedRanges(delta),
+      delta: deltaReference(delta),
+      createdAt: new Date(this.now()).toISOString(),
+    };
+    monitor.diffArtifacts.set(artifact.id, artifact);
+    monitor.diffArtifactsByRange.set(rangeKey, artifact.id);
+    this.#pruneDiffArtifacts(monitor, artifact.id);
+    return artifact;
+  }
+
+  #saveResult(monitor, afterRevision) {
+    const current = this.#requireRevisionArtifact(monitor, monitor.revision);
+    const latestEvent = monitor.events.at(-1);
+    let diffArtifact = null;
+    let rebaselineRequired = false;
+    try {
+      diffArtifact = this.#createDiffArtifact(
+        monitor,
+        afterRevision,
+        monitor.revision,
+      );
+    } catch (error) {
+      if (error.code !== "REVISION_NOT_AVAILABLE") throw error;
+      rebaselineRequired = true;
+    }
     return {
-      state: "changed",
-      historyTruncated,
-      rebaselineRequired: historyTruncated || delta.truncated,
+      state: "saved",
+      rebaselineRequired,
       event: {
-        ...event,
-        previousRevision: monitor.analysisBaselineRevision,
-        fromRevision: monitor.analysisBaselineRevision,
-        semanticHash: semanticHash(snapshot.text),
-        changedRanges: changedRanges(delta),
-        delta: deltaReference(delta),
+        type: latestEvent?.type ?? "changed",
+        monitorId: monitor.id,
+        path: monitor.path,
+        saveSequence: latestEvent?.saveSequence ?? monitor.saveSequence,
+        fromRevision: afterRevision,
+        revision: monitor.revision,
+        revisionArtifactId: current.id,
+        diffArtifactId: diffArtifact?.id ?? null,
+        contentHash: current.contentHash,
+        changedRanges: diffArtifact?.changedRanges ?? [],
+        delta: diffArtifact?.delta ?? null,
+        observedAt: latestEvent?.observedAt ?? monitor.lastEventAt,
+        metadata: publicMetadata(monitor.observedSnapshot?.metadata),
       },
     };
   }
@@ -1070,33 +1802,80 @@ export class MonitorSession {
   }
 
   async #poll(monitor) {
-    if (monitor.status !== "active" || monitor.polling || monitor.settling) return;
+    if (monitor.status !== "active" || monitor.polling) return;
     monitor.polling = true;
     try {
       const metadata = await probeMetadata(monitor.path);
+      monitor.missingProbes = 0;
       if (
-        monitor.observedSnapshot.metadata &&
-        metadataSignature(metadata) === metadataSignature(monitor.observedSnapshot.metadata)
-      ) return;
+        monitor.observedSnapshot?.metadata &&
+        metadataSignature(metadata) ===
+          metadataSignature(monitor.observedSnapshot.metadata)
+      ) {
+        return;
+      }
 
-      const current = await readPathOnce(monitor.path);
-      const previousHash = monitor.observedSemanticHash;
-      const currentHash = semanticHash(current.text);
+      const previousObserved = monitor.observedSnapshot;
+      const current = await readStablePath(monitor.path, READ_RETRY_DELAY_MS);
+      if (
+        previousObserved?.metadata &&
+        metadataSignature(current.metadata) ===
+          metadataSignature(previousObserved.metadata)
+      ) {
+        return;
+      }
+
       monitor.observedSnapshot = current;
-      monitor.observedSemanticHash = currentHash;
-      if (currentHash === previousHash) return;
+      monitor.saveSequence += 1;
+      monitor.lastSaveAt = new Date(this.now()).toISOString();
+      monitor.saveRecords.push({
+        saveSequence: monitor.saveSequence,
+        metadata: current.metadata,
+        contentHash: computeContentHash(current.text),
+        savedAt: monitor.lastSaveAt,
+      });
+      if (monitor.saveRecords.length > MAX_EVENT_HISTORY) monitor.saveRecords.shift();
 
-      monitor.pendingMeaningfulChange = true;
-      this.#markMeaningfulActivity(monitor);
-      this.#scheduleSettle(monitor, `present:${currentHash}`);
+      const nextContentHash = computeContentHash(current.text);
+      if (nextContentHash === monitor.currentContentHash) return;
+      this.#markContentActivity(monitor);
+
+      const replaced =
+        previousObserved?.metadata &&
+        identitySignature(previousObserved.metadata) !==
+          identitySignature(current.metadata);
+      const previousRevision = monitor.revision;
+      monitor.revision += 1;
+      monitor.currentContentHash = nextContentHash;
+      const revisionArtifact = this.#storeRevisionArtifact(
+        monitor,
+        monitor.revision,
+        current,
+      );
+      const diffArtifact = this.#createDiffArtifact(
+        monitor,
+        previousRevision,
+        monitor.revision,
+      );
+      const event = {
+        type: replaced ? "replaced" : "changed",
+        monitorId: monitor.id,
+        path: monitor.path,
+        saveSequence: monitor.saveSequence,
+        revision: monitor.revision,
+        revisionArtifactId: revisionArtifact.id,
+        diffArtifactId: diffArtifact.id,
+        contentHash: nextContentHash,
+        observedAt: new Date(this.now()).toISOString(),
+        metadata: publicMetadata(current.metadata),
+      };
+      this.#emit(monitor, event);
+      this.#pruneArtifacts(monitor);
     } catch (error) {
       if (error.code === "TARGET_NOT_FOUND") {
-        if (monitor.observedSnapshot.metadata !== null) {
-          monitor.observedSnapshot = { text: "", metadata: null };
-          monitor.observedSemanticHash = semanticHash("");
-          monitor.pendingMeaningfulChange = true;
-          this.#markMeaningfulActivity(monitor);
-          this.#scheduleSettle(monitor, "missing");
+        monitor.missingProbes += 1;
+        if (monitor.missingProbes >= 2) {
+          this.#stop(monitor, "target-deleted", "stopped", "deleted");
         }
       } else if (error.code === "TARGET_CHANGED_DURING_READ") {
         return;
@@ -1108,143 +1887,77 @@ export class MonitorSession {
     }
   }
 
-  #scheduleSettle(monitor, pendingKey) {
-    if (monitor.pendingKey === pendingKey && monitor.settleTimer) return;
-    clearTimeout(monitor.settleTimer);
-    monitor.pendingKey = pendingKey;
-    monitor.settleTimer = setTimeout(() => {
-      monitor.settleTimer = null;
-      void this.#settle(monitor, pendingKey);
-    }, monitor.settleMs);
-    monitor.settleTimer.unref?.();
-  }
-
-  #clearPending(monitor) {
-    clearTimeout(monitor.settleTimer);
-    monitor.settleTimer = null;
-    monitor.pendingKey = null;
-    monitor.pendingMeaningfulChange = false;
-  }
-
-  async #settle(monitor, expectedKey) {
-    if (monitor.status !== "active" || monitor.pendingKey !== expectedKey) return;
-    monitor.settling = true;
-    try {
-      let metadata;
-      try {
-        metadata = await probeMetadata(monitor.path);
-      } catch (error) {
-        if (error.code === "TARGET_NOT_FOUND") {
-          if (expectedKey !== "missing") {
-            this.#scheduleSettle(monitor, "missing");
-            return;
-          }
-          const current = { text: "", metadata: null };
-          monitor.observedSnapshot = current;
-          monitor.observedSemanticHash = semanticHash("");
-          monitor.revisionSnapshot = current;
-          monitor.revisionSemanticHash = semanticHash("");
-          monitor.revision += 1;
-          this.#storeRevisionSnapshot(monitor, monitor.revision, current);
-          this.#clearPending(monitor);
-          this.#emit(monitor, {
-            type: "deleted",
-            monitorId: monitor.id,
-            path: monitor.path,
-            revision: monitor.revision,
-            observedAt: new Date(this.now()).toISOString(),
-            metadata: null,
-          });
-          this.#stop(monitor, "target-deleted", "stopped");
-          return;
-        }
-        throw error;
-      }
-
-      const current = await readStablePath(monitor.path, READ_RETRY_DELAY_MS);
-      const currentHash = semanticHash(current.text);
-      const currentKey = `present:${currentHash}`;
-      const previousObservedHash = monitor.observedSemanticHash;
-      monitor.observedSnapshot = current;
-      monitor.observedSemanticHash = currentHash;
-      if (currentKey !== expectedKey) {
-        if (currentHash !== previousObservedHash) this.#markMeaningfulActivity(monitor);
-        monitor.pendingMeaningfulChange = true;
-        this.#scheduleSettle(monitor, currentKey);
-        return;
-      }
-
-      if (currentHash === monitor.revisionSemanticHash) {
-        this.#clearPending(monitor);
-        this.#resolveAvailableEventWaiters(monitor);
-        return;
-      }
-
-      const replaced =
-        identitySignature(monitor.revisionSnapshot.metadata) !== identitySignature(current.metadata);
-      monitor.revisionSnapshot = current;
-      monitor.revisionSemanticHash = currentHash;
-      monitor.revision += 1;
-      this.#storeRevisionSnapshot(monitor, monitor.revision, current);
-      this.#clearPending(monitor);
-      this.#emit(monitor, {
-        type: replaced ? "replaced" : "changed",
-        monitorId: monitor.id,
-        path: monitor.path,
-        revision: monitor.revision,
-        observedAt: new Date(this.now()).toISOString(),
-        metadata: publicMetadata(current.metadata),
-      });
-    } catch (error) {
-      if (error.code === "TARGET_CHANGED_DURING_READ") {
-        this.#scheduleSettle(monitor, monitor.pendingKey ?? expectedKey);
-        return;
-      }
-      this.#fail(monitor, error);
-    } finally {
-      monitor.settling = false;
-    }
-  }
-
-  #storeRevisionSnapshot(monitor, revision, snapshot) {
-    monitor.revisionSnapshots.set(revision, snapshot);
-    while (monitor.revisionSnapshots.size > MAX_EVENT_HISTORY + 2) {
-      const removable = [...monitor.revisionSnapshots.keys()].find(
-        (candidate) =>
-          candidate !== monitor.analysisBaselineRevision && candidate !== monitor.revision,
-      );
-      if (removable === undefined) break;
-      monitor.revisionSnapshots.delete(removable);
-    }
-  }
-
   #emit(monitor, event) {
     monitor.lastEventAt = event.observedAt;
     monitor.events.push(event);
     if (monitor.events.length > MAX_EVENT_HISTORY) monitor.events.shift();
     for (const waiter of [...monitor.waiters]) {
       if (event.revision > waiter.afterRevision) {
-        waiter.resolve(this.#eventResult(monitor, event, waiter.afterRevision));
+        waiter.resolve(this.#saveResult(monitor, waiter.afterRevision));
       }
     }
   }
 
-  #resolveAvailableEventWaiters(monitor) {
-    if (monitor.pendingMeaningfulChange) return;
-    for (const waiter of [...monitor.waiters]) {
-      let event;
-      for (let index = monitor.events.length - 1; index >= 0; index -= 1) {
-        if (monitor.events[index].revision > waiter.afterRevision) {
-          event = monitor.events[index];
-          break;
-        }
+  #pruneArtifacts(monitor) {
+    while (monitor.revisionArtifacts.size > MAX_EVENT_HISTORY + 2) {
+      const removable = [...monitor.revisionArtifacts.keys()].find(
+        (candidate) => candidate !== monitor.revision,
+      );
+      if (removable === undefined) break;
+      const artifact = monitor.revisionArtifacts.get(removable);
+      monitor.revisionArtifacts.delete(removable);
+      monitor.revisionArtifactsById.delete(artifact.id);
+
+      const fieldArtifactId = monitor.fieldArtifactByRevision.get(removable);
+      if (fieldArtifactId) {
+        monitor.fieldArtifactByRevision.delete(removable);
+        monitor.fieldArtifacts.delete(fieldArtifactId);
       }
-      if (event) waiter.resolve(this.#eventResult(monitor, event, waiter.afterRevision));
+      const feedbackArtifactId = monitor.feedbackArtifactByRevision.get(removable);
+      if (feedbackArtifactId) {
+        monitor.feedbackArtifactByRevision.delete(removable);
+        monitor.feedbackArtifacts.delete(feedbackArtifactId);
+        monitor.publishedFeedbackIds = monitor.publishedFeedbackIds.filter(
+          (candidate) => candidate !== feedbackArtifactId,
+        );
+      }
+    }
+
+    for (const [artifactId, artifact] of monitor.diffArtifacts) {
+      if (
+        !monitor.revisionArtifacts.has(artifact.fromRevision) ||
+        !monitor.revisionArtifacts.has(artifact.revision)
+      ) {
+        monitor.diffArtifacts.delete(artifactId);
+        monitor.diffArtifactsByRange.delete(
+          artifact.fromRevision + ":" + artifact.revision,
+        );
+      }
+    }
+    this.#pruneDiffArtifacts(monitor);
+  }
+
+  #pruneDiffArtifacts(monitor, protectedArtifactId = undefined) {
+    while (monitor.diffArtifacts.size > MAX_DIFF_ARTIFACTS) {
+      const referenced = new Set([
+        ...[...monitor.fieldArtifacts.values()].map((artifact) => artifact.sourceArtifactId),
+        ...[...monitor.feedbackArtifacts.values()].map((artifact) => artifact.sourceArtifactId),
+      ]);
+      const removable = [...monitor.diffArtifacts.entries()].find(
+        ([artifactId]) =>
+          artifactId !== protectedArtifactId && !referenced.has(artifactId),
+      );
+      if (!removable) break;
+      const [artifactId, artifact] = removable;
+      monitor.diffArtifacts.delete(artifactId);
+      monitor.diffArtifactsByRange.delete(
+        artifact.fromRevision + ":" + artifact.revision,
+      );
     }
   }
 
-  #markMeaningfulActivity(monitor) {
-    monitor.lastMeaningfulActivityAtMs = this.now();
+  #markContentActivity(monitor) {
+    monitor.lastContentActivityAtMs = this.now();
     monitor.idleWarningIssued = false;
     monitor.idleWarningPending = false;
     monitor.idleWarningDelivered = false;
@@ -1254,7 +1967,7 @@ export class MonitorSession {
   #scheduleIdleTimer(monitor) {
     clearTimeout(monitor.idleTimer);
     if (monitor.status !== "active") return;
-    const elapsed = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    const elapsed = Math.max(0, this.now() - monitor.lastContentActivityAtMs);
     const threshold = monitor.idleWarningIssued ? this.idleStopMs : this.idleWarningMs;
     const delay = Math.max(1, threshold - elapsed);
     monitor.idleTimer = setTimeout(() => this.#handleIdleTimer(monitor), delay);
@@ -1263,7 +1976,7 @@ export class MonitorSession {
 
   #handleIdleTimer(monitor) {
     if (monitor.status !== "active") return;
-    const elapsed = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    const elapsed = Math.max(0, this.now() - monitor.lastContentActivityAtMs);
     if (!monitor.idleWarningIssued && elapsed >= this.idleWarningMs) {
       monitor.idleWarningIssued = true;
       monitor.idleWarningPending = true;
@@ -1280,18 +1993,19 @@ export class MonitorSession {
       return;
     }
     if (monitor.idleWarningIssued && elapsed >= this.idleStopMs) {
-      this.#stop(monitor, "idle-timeout", "stopped");
+      this.#stop(monitor, "idle-timeout", "stopped", "idle-stopped");
       return;
     }
     this.#scheduleIdleTimer(monitor);
   }
 
   #idleWarningResult(monitor) {
-    const idleForMs = Math.max(0, this.now() - monitor.lastMeaningfulActivityAtMs);
+    const idleForMs = Math.max(0, this.now() - monitor.lastContentActivityAtMs);
     return {
       state: "idle-warning",
       monitorId: monitor.id,
       revision: monitor.revision,
+      saveSequence: monitor.saveSequence,
       status: monitor.status,
       idleForMs,
       stopInMs: Math.max(0, this.idleStopMs - idleForMs),
@@ -1301,32 +2015,59 @@ export class MonitorSession {
 
   #fail(monitor, error) {
     const normalized = translateFileError(error, monitor.path);
-    monitor.error = { code: normalized.code, message: normalized.message, details: normalized.details };
-    this.#stop(monitor, "runtime-failed", "error");
+    monitor.error = {
+      code: normalized.code,
+      message: normalized.message,
+      details: normalized.details,
+    };
+    this.#stop(monitor, "runtime-failed", "error", "error");
   }
 
-  #stop(monitor, reason, status, resolveWaiters = true) {
+  #purge(monitor) {
+    if (monitor.purged) return;
+    monitor.prompt = "";
+    monitor.promptHash = null;
+    monitor.promptRef = null;
+    monitor.observedSnapshot = null;
+    monitor.currentContentHash = null;
+    monitor.revisionArtifacts.clear();
+    monitor.revisionArtifactsById.clear();
+    monitor.diffArtifacts.clear();
+    monitor.diffArtifactsByRange.clear();
+    monitor.fieldArtifacts.clear();
+    monitor.fieldArtifactByRevision.clear();
+    monitor.feedbackArtifacts.clear();
+    monitor.feedbackArtifactByRevision.clear();
+    monitor.publishedFeedbackIds.length = 0;
+    monitor.saveRecords.length = 0;
+    monitor.events.length = 0;
+    monitor.purged = true;
+  }
+
+  #stop(monitor, reason, status, stateOverride = undefined) {
     clearInterval(monitor.pollTimer);
-    clearTimeout(monitor.settleTimer);
     clearTimeout(monitor.idleTimer);
     monitor.pollTimer = null;
-    monitor.settleTimer = null;
     monitor.idleTimer = null;
-    monitor.pendingKey = null;
-    monitor.pendingMeaningfulChange = false;
     monitor.status = status;
     monitor.reason = reason;
-    if (this.activeByPath.get(monitor.path) === monitor.id) this.activeByPath.delete(monitor.path);
-    if (!resolveWaiters) return;
+    if (this.activeByPath.get(monitor.path) === monitor.id) {
+      this.activeByPath.delete(monitor.path);
+    }
+    this.#purge(monitor);
     const result = {
       state:
-        status === "error" ? "error" : reason === "idle-timeout" ? "idle-stopped" : "stopped",
+        stateOverride ??
+        (status === "error"
+          ? "error"
+          : reason === "idle-timeout"
+            ? "idle-stopped"
+            : "stopped"),
       ...this.#status(monitor),
     };
     for (const waiter of [...monitor.waiters]) waiter.resolve(result);
   }
 }
-
 function toolSuccess(data) {
   return {
     content: [{ type: "text", text: JSON.stringify(data) }],
@@ -1360,11 +2101,32 @@ export async function callTool(session, name, args, signal = undefined) {
       case "start_monitor":
         result = await session.startMonitor(args);
         break;
-      case "read_snapshot":
-        result = session.readSnapshot(args);
+      case "read_revision":
+        result = session.readRevision(args);
         break;
-      case "wait_for_change":
-        result = await session.waitForChange(args, signal);
+      case "wait_for_save":
+        result = await session.waitForSave(args, signal);
+        break;
+      case "read_diff_artifact":
+        result = session.readDiffArtifact(args);
+        break;
+      case "store_field_analysis":
+        result = session.storeFieldAnalysis(args);
+        break;
+      case "read_field_analysis":
+        result = session.readFieldAnalysis(args);
+        break;
+      case "read_review_bundle":
+        result = session.readReviewBundle(args);
+        break;
+      case "store_feedback_draft":
+        result = session.storeFeedbackDraft(args);
+        break;
+      case "read_feedback_artifact":
+        result = session.readFeedbackArtifact(args);
+        break;
+      case "mark_feedback_published":
+        result = session.markFeedbackPublished(args);
         break;
       case "get_status":
         result = session.getStatus(args);

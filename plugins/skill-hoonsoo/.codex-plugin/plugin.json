@@ -1,7 +1,7 @@
 {
   "name": "skill-hoonsoo",
-  "version": "0.2.0",
-  "description": "Read-only live context and grammar review for local documents.",
+  "version": "0.3.0",
+  "description": "Read-only combined content and grammar review for saved local document revisions.",
   "author": {
     "name": "dragonpond"
   },
@@ -19,16 +19,16 @@
   },
   "interface": {
     "displayName": "Hoonsoo",
-    "shortDescription": "Read-only live document review advice.",
-    "longDescription": "Monitors user-selected documents, reviews their changes, and provides context and grammar advice without modifying source files.",
+    "shortDescription": "Read-only advice whenever a document is saved.",
+    "longDescription": "Observes user-selected documents only after changes reach disk, then reviews content, structure, and grammar without modifying source files.",
     "developerName": "dragonpond",
     "category": "Productivity",
     "capabilities": [
       "Read"
     ],
     "defaultPrompt": [
-      "Monitor this document in context mode and advise me as I edit.",
-      "Monitor this document for grammar and style issues as I edit."
+      "Use $hoonsoo with a local file path to review its content, structure, and grammar whenever it is saved.",
+      "Use $hoonsoo with a local file path and my additional review priorities, then wait for saved revisions."
     ]
   }
 }
