@@ -1,13 +1,13 @@
 interface:
   display_name: "Hoonsoo"
-  short_description: "Save-triggered content and grammar review"
-  default_prompt: "Use $hoonsoo <filepath> <prompt> to monitor disk-backed saves and review both content and grammar without editing the file."
+  short_description: "Fast save-triggered content and grammar review"
+  default_prompt: "Use $hoonsoo <filepath> <prompt> to monitor disk-backed saves. Review content and grammar together in one current-host pass, without subagents or file edits."
 
 dependencies:
   tools:
     - type: "mcp"
       value: "hoonsoo"
-      description: "Read-only document monitor with versioned session-memory review artifacts"
+      description: "Read-only document monitor with one-call review context and atomic feedback publication"
       transport: "stdio"
 
 policy:

@@ -1,8 +1,8 @@
 {
   "name": "skill-hoonsoo",
   "displayName": "Hoonsoo",
-  "version": "0.3.0",
-  "description": "Read-only combined content and grammar review for saved local document revisions.",
+  "version": "0.4.0",
+  "description": "Fast read-only combined content and grammar review for saved local document revisions.",
   "author": {
     "name": "dragonpond",
     "url": "https://github.com/dragonpond916"

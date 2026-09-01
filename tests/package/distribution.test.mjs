@@ -61,7 +61,7 @@ async function smokeTestMcp(server, host) {
       clientInfo: { name: `${host}-package-test`, version: "1.0.0" },
     });
     assert.equal(response.result.serverInfo.name, "hoonsoo", stderr);
-    assert.equal(response.result.serverInfo.version, "0.3.0", stderr);
+    assert.equal(response.result.serverInfo.version, "0.4.0", stderr);
   } finally {
     child.stdin.end();
     child.kill("SIGTERM");
@@ -87,8 +87,6 @@ test("package contains only the install-time files", async () => {
   assert.deepEqual(await listFiles(packageDirectory), [
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
-    "agents/hoonsoo-advisor.md",
-    "agents/hoonsoo-field-checker.md",
     "claude.mcp.json",
     "scripts/hoonsoo-mcp.mjs",
     "skills/hoonsoo/SKILL.md",
@@ -99,7 +97,7 @@ test("package contains only the install-time files", async () => {
   const claudeManifest = await readJson(packageDirectory, ".claude-plugin", "plugin.json");
   assert.equal(codexManifest.name, "skill-hoonsoo");
   assert.equal(claudeManifest.name, codexManifest.name);
-  assert.equal(codexManifest.version, "0.3.0");
+  assert.equal(codexManifest.version, "0.4.0");
   assert.equal(claudeManifest.version, codexManifest.version);
   assert.equal(codexManifest.mcpServers.hoonsoo.cwd, ".");
   assert.equal(claudeManifest.mcpServers, "./claude.mcp.json");

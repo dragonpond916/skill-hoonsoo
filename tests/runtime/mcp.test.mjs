@@ -129,7 +129,7 @@ afterEach(async () => {
   );
 });
 
-test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () => {
+test("serves the 0.4.0 six-tool inline review lifecycle over JSONL stdio", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "large-document.md");
   await writeFile(target, "x".repeat(100_000), "utf8");
@@ -143,8 +143,11 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
   });
   assert.equal(initialize.result.protocolVersion, "2024-11-05");
   assert.equal(initialize.result.serverInfo.name, "hoonsoo");
-  assert.equal(initialize.result.serverInfo.version, "0.3.0");
+  assert.equal(initialize.result.serverInfo.version, "0.4.0");
   assert.deepEqual(initialize.result.capabilities, { tools: { listChanged: false } });
+  assert.match(initialize.result.instructions.slice(0, 512), /six tools/i);
+  assert.match(initialize.result.instructions.slice(0, 512), /current host/i);
+  assert.match(initialize.result.instructions.slice(0, 512), /do not use subagents/i);
   client.notify("notifications/initialized");
 
   const ping = await client.request("ping");
@@ -155,24 +158,14 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
     listed.result.tools.map((tool) => tool.name),
     [
       "start_monitor",
-      "read_revision",
+      "read_review_context",
+      "publish_feedback",
       "wait_for_save",
-      "read_diff_artifact",
-      "store_field_analysis",
-      "read_field_analysis",
-      "read_review_bundle",
-      "store_feedback_draft",
-      "read_feedback_artifact",
-      "mark_feedback_published",
       "get_status",
       "stop_monitor",
     ],
   );
-  const sessionMemoryStores = new Set([
-    "store_field_analysis",
-    "store_feedback_draft",
-    "mark_feedback_published",
-  ]);
+  const sessionMemoryStores = new Set(["read_review_context", "publish_feedback"]);
   for (const tool of listed.result.tools) {
     assert.equal(tool.annotations.readOnlyHint, !sessionMemoryStores.has(tool.name));
     assert.equal(tool.annotations.destructiveHint, false);
@@ -183,6 +176,7 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
   assert.deepEqual(startDefinition.inputSchema.required, ["path"]);
   assert.equal(Object.hasOwn(startDefinition.inputSchema.properties, "settleMs"), false);
   assert.equal(startDefinition.inputSchema.properties.prompt.maxLength, 8_000);
+  assert.equal(startDefinition.inputSchema.properties.pollIntervalMs.default, 250);
   const waitDefinition = listed.result.tools.find((tool) => tool.name === "wait_for_save");
   assert.equal(
     Object.hasOwn(waitDefinition.inputSchema.properties.timeoutMs, "default"),
@@ -191,32 +185,73 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
 
   const startCall = await client.request("tools/call", {
     name: "start_monitor",
-    arguments: { path: target, prompt: "Review content and grammar.", pollIntervalMs: 25 },
+    arguments: { path: target, prompt: "Review content and grammar." },
   });
   assert.equal(startCall.result.isError, undefined);
   const started = startCall.result.structuredContent;
   assert.equal(started.status, "active");
   assert.equal(started.revision, 0);
+  assert.equal(started.pollIntervalMs, 250);
   assert.match(started.promptRef, /^prompt-monitor-\d+-[a-f0-9]{16}$/);
+  const compactStart = JSON.parse(startCall.result.content[0].text);
+  assert.equal(compactStart.monitorId, started.monitorId);
+  assert.equal(Object.hasOwn(compactStart, "path"), false);
 
-  const snapshotCall = await client.request("tools/call", {
-    name: "read_revision",
+  const contextCall = await client.request("tools/call", {
+    name: "read_review_context",
+    arguments: { monitorId: started.monitorId },
+  });
+  const context = contextCall.result.structuredContent;
+  assert.equal(context.state, "review-ready");
+  assert.equal(context.revision, 0);
+  assert.equal(context.contentHash, started.contentHash);
+  assert.equal(context.sourceKind, "revision");
+  assert.equal(context.sourceArtifactId, started.revisionArtifactId);
+  assert.equal(context.prompt, "Review content and grammar.");
+  assert.equal(context.excerpt.content.length, 12_000);
+  assert.equal(context.documentContext.content.length, 32_000);
+  assert.equal(context.documentContext.totalCharacters, 100_000);
+  assert.equal(context.documentContext.truncated, true);
+  assert.match(context.reviewToken, /^review-/);
+  const compactContext = JSON.parse(contextCall.result.content[0].text);
+  assert.equal(compactContext.reviewToken, context.reviewToken);
+  assert.equal(Object.hasOwn(compactContext, "excerpt"), false);
+  assert.equal(Object.hasOwn(compactContext, "documentContext"), false);
+  assert.ok(contextCall.result.content[0].text.length < 1_000);
+
+  const reusedContextCall = await client.request("tools/call", {
+    name: "read_review_context",
     arguments: { monitorId: started.monitorId, revision: 0 },
   });
-  const snapshot = snapshotCall.result.structuredContent;
-  assert.equal(snapshot.content.length, 32_000);
-  assert.equal(snapshot.pagination.totalCharacters, 100_000);
-  assert.equal(snapshot.pagination.nextOffset, 32_000);
-  assert.equal(snapshot.pagination.hasMore, true);
-  assert.equal(snapshot.promptRef, started.promptRef);
-  assert.equal(snapshot.prompt, "Review content and grammar.");
-  assert.ok(JSON.stringify(snapshotCall).length < 100_000);
+  assert.equal(reusedContextCall.result.structuredContent.reviewToken, context.reviewToken);
+  assert.equal(reusedContextCall.result.structuredContent.leaseExpiresAt, context.leaseExpiresAt);
+  assert.equal(reusedContextCall.result.structuredContent.reused, true);
+
+  const publishCall = await client.request("tools/call", {
+    name: "publish_feedback",
+    arguments: {
+      monitorId: started.monitorId,
+      reviewToken: context.reviewToken,
+      revision: context.revision,
+      contentHash: context.contentHash,
+      feedback: "Natural-language baseline feedback",
+    },
+  });
+  const published = publishCall.result.structuredContent;
+  assert.equal(published.state, "published");
+  assert.equal(published.fieldArtifactId, null);
+  assert.equal(published.publishedRevision, 0);
+  assert.equal(published.feedback, "Natural-language baseline feedback");
+  const compactPublished = JSON.parse(publishCall.result.content[0].text);
+  assert.equal(compactPublished.feedbackArtifactId, published.feedbackArtifactId);
+  assert.equal(Object.hasOwn(compactPublished, "feedback"), false);
 
   const statusCall = await client.request("tools/call", {
     name: "get_status",
     arguments: { monitorId: started.monitorId },
   });
   assert.equal(statusCall.result.structuredContent.monitorId, started.monitorId);
+  assert.equal(statusCall.result.structuredContent.reviewLease.active, false);
 
   const waitCall = await client.request("tools/call", {
     name: "wait_for_save",
@@ -224,6 +259,7 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
   });
   assert.equal(waitCall.result.structuredContent.state, "timeout");
 
+  const savedAt = Date.now();
   await writeFile(target, `${"x".repeat(99_999)}y`, "utf8");
   const changedCall = await client.request(
     "tools/call",
@@ -236,72 +272,37 @@ test("serves the 0.3.0 save and artifact lifecycle over JSONL stdio", async () =
   assert.equal(changedCall.result.structuredContent.state, "saved");
   assert.equal(changedCall.result.structuredContent.event.type, "changed");
   assert.equal(changedCall.result.structuredContent.event.revision, 1);
+  assert.ok(Date.now() - savedAt < 750, "default polling did not detect the save quickly");
 
   const changed = changedCall.result.structuredContent.event;
-  const diffCall = await client.request("tools/call", {
-    name: "read_diff_artifact",
-    arguments: { monitorId: started.monitorId, diffArtifactId: changed.diffArtifactId },
+  const changedContextCall = await client.request("tools/call", {
+    name: "read_review_context",
+    arguments: { monitorId: started.monitorId, revision: 1 },
   });
-  assert.equal(diffCall.result.structuredContent.revision, 1);
-  assert.match(diffCall.result.structuredContent.content, /y/);
-  assert.equal(diffCall.result.structuredContent.promptRef, started.promptRef);
+  const changedContext = changedContextCall.result.structuredContent;
+  assert.equal(changedContext.sourceKind, "diff");
+  assert.equal(changedContext.sourceArtifactId, changed.diffArtifactId);
+  assert.equal(changedContext.recentPublishedFeedback.length, 1);
+  assert.equal(changedContext.recentPublishedFeedback[0].revision, 0);
 
-  const fieldCall = await client.request("tools/call", {
-    name: "store_field_analysis",
+  const changedPublishCall = await client.request("tools/call", {
+    name: "publish_feedback",
     arguments: {
       monitorId: started.monitorId,
+      reviewToken: changedContext.reviewToken,
       revision: 1,
       contentHash: changed.contentHash,
-      sourceArtifactId: changed.diffArtifactId,
-      field: "technical document",
-      analysis: "FieldChecker result",
+      feedback: "Natural-language revision feedback",
     },
   });
-  assert.equal(fieldCall.result.isError, undefined);
-  const field = fieldCall.result.structuredContent;
-  const bundleCall = await client.request("tools/call", {
-    name: "read_review_bundle",
-    arguments: {
-      monitorId: started.monitorId,
-      revision: 1,
-      contentHash: changed.contentHash,
-      sourceArtifactId: changed.diffArtifactId,
-      fieldArtifactId: field.fieldArtifactId,
-    },
-  });
-  assert.equal(bundleCall.result.structuredContent.prompt, "Review content and grammar.");
-  assert.equal(bundleCall.result.structuredContent.promptRef, started.promptRef);
+  assert.equal(changedPublishCall.result.structuredContent.publishedRevision, 1);
 
-  const draftCall = await client.request("tools/call", {
-    name: "store_feedback_draft",
-    arguments: {
-      monitorId: started.monitorId,
-      revision: 1,
-      contentHash: changed.contentHash,
-      sourceArtifactId: changed.diffArtifactId,
-      fieldArtifactId: field.fieldArtifactId,
-      feedback: "Natural-language feedback",
-    },
-  });
-  const draft = draftCall.result.structuredContent;
-  const publishCall = await client.request("tools/call", {
-    name: "mark_feedback_published",
-    arguments: {
-      monitorId: started.monitorId,
-      feedbackArtifactId: draft.feedbackArtifactId,
-      revision: 1,
-      contentHash: changed.contentHash,
-      expectedPublishedRevision: -1,
-    },
-  });
-  assert.equal(publishCall.result.structuredContent.publishedRevision, 1);
-
-  const changedSnapshotCall = await client.request("tools/call", {
+  const hiddenToolCall = await client.request("tools/call", {
     name: "read_revision",
-    arguments: { monitorId: started.monitorId, revision: 1, offset: 99_999, maxCharacters: 1 },
+    arguments: { monitorId: started.monitorId, revision: 1 },
   });
-  assert.equal(changedSnapshotCall.result.structuredContent.revision, 1);
-  assert.equal(changedSnapshotCall.result.structuredContent.content, "y");
+  assert.equal(hiddenToolCall.result.isError, true);
+  assert.equal(hiddenToolCall.result.structuredContent.error.code, "TOOL_NOT_FOUND");
 
   const stopCall = await client.request("tools/call", {
     name: "stop_monitor",

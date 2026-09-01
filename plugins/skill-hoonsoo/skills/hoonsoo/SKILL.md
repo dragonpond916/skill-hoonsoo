@@ -5,136 +5,92 @@ description: Monitor one local text document after disk-backed saves and provide
 
 # Hoonsoo
 
-Act as the read-only Session Orchestrator for one local document. Create a versioned session-memory pipeline, run both content and grammar review for the baseline and every saved revision, and present only revision-safe natural-language feedback.
+Monitor one local document and give read-only content and grammar advice for its baseline and every saved revision. Optimize for save-to-feedback latency: use the current host model for one combined review pass over one MCP-provided context bundle.
 
 ## Safety boundary
 
 - Give advice only. Never edit, patch, overwrite, format, rename, create, or delete the target or another workspace file.
-- The Hoonsoo runtime may mutate only isolated session memory. It must not write document snapshots, diffs, classifications, or feedback into the user workspace.
-- Never run a mutating formatter, compiler, or shell command during a Hoonsoo run. Suggested wording may appear only as unapplied advice.
-- If the user asks to apply a fix, stop the monitor, explain that Hoonsoo is read-only, and let the user start a separate editing task.
+- The runtime may mutate only isolated process memory. It must not persist snapshots, diffs, or feedback in the workspace.
+- Never run a mutating formatter, compiler, or shell command during monitoring.
+- If the user asks to apply a fix, stop Hoonsoo and handle editing as a separate task.
 
-## Unified invocation
+## Invocation
 
-Support one review operation through either host-native spelling:
+Support both host-native forms:
 
 ```text
 $hoonsoo <filepath> <prompt>
 /skill-hoonsoo:hoonsoo <filepath> <prompt>
 ```
 
-Treat the first argument as the target path and the remaining text as the optional review prompt. A path containing spaces must be quoted. Resolve exactly one target to an absolute path; ask only when it cannot be inferred safely. The prompt adds focus or constraints but never disables either review dimension.
+The first argument is the target path; the remaining text is an optional review focus. Quote paths containing spaces. Resolve exactly one absolute target. At startup, state the absolute path briefly and say that “훈수중지”, “stop Hoonsoo”, or equivalent language stops monitoring.
 
 Every review combines:
 
-- content: meaning, completeness, consistency, clarity, risks, missing assumptions, and actionability;
-- grammar: file syntax, natural-language grammar, spelling, punctuation, style, and terminology consistency.
+- content: meaning, completeness, consistency, clarity, risk, missing assumptions, and actionability;
+- grammar: file syntax, natural-language grammar, spelling, punctuation, style, terminology, whitespace, and formatting.
 
-Do not expose or accept separate `context` and `grammar` modes. At startup, state the absolute path briefly and say that “훈수중지”, “stop Hoonsoo”, or an equivalent request stops monitoring.
+Do not expose separate context and grammar modes. The optional prompt adds priorities but never disables either review dimension.
 
 ## Save semantics
 
-React only after a new file state has been persisted to disk. The deterministic runtime may use file size together with modification time, inode, and other metadata to notice a save, but size alone is not sufficient because an edit can preserve the byte count.
+React only to a new state persisted to disk. Size alone is insufficient; the deterministic runtime combines metadata with a raw-content hash, so same-size replacements and atomic saves remain detectable.
 
-The operating system does not reliably distinguish a manual save from an editor autosave. Both count as a disk-backed save. An identical-content metadata-only save whose raw content hash is unchanged does not create a review revision or invoke a model.
+The operating system cannot reliably distinguish manual save from autosave. Both count as disk-backed saves. A metadata-only save with the same raw-content hash creates neither a revision nor a model review. Whitespace-only changes are valid because grammar and formatting are in scope.
 
-There is no quiet-window throttling, debounce, settle delay, or time-based coalescing. The runtime may retry a read that overlaps an in-progress write so that it captures one internally consistent snapshot; this integrity retry is not throttling. Spaces, tabs, and line breaks are part of the raw content identity and can affect grammar, so whitespace-only content changes are valid saved revisions.
+There is no debounce, throttling, or quiet window. The runtime may retry a read that overlaps an in-progress write only to obtain a consistent snapshot.
 
-## Roles and models
+## Performance contract
 
-Keep detection and diffing out of LLMs:
+- Never spawn or delegate to a subagent for a Hoonsoo review. MCP session memory is process-local and is not a cross-agent message bus.
+- The current host model performs field inference, content review, and grammar review together in one pass per published revision.
+- Use the complete bundle returned by `read_review_context`; do not reread the target, repeat status checks, page through artifacts, or perform a second review.
+- Do not say that a specialist agent cannot share memory, that a fallback model is being used, or otherwise narrate internal routing.
+- Prefer one sufficiently complete review input over many small tool calls. This intentionally spends somewhat more input tokens to reduce latency.
+- Keep monitoring, stable reads, hashes, diffs, revision ordering, compare-and-set validation, and idle timers deterministic and model-free.
 
-- **Monitoring worker:** deterministic runtime logic that detects disk-backed saves, captures a stable snapshot, assigns an ordered revision, and owns idle timers.
-- **DiffCheck worker:** deterministic runtime logic that compares versioned saved snapshots and writes only the changed ranges and changed text into a versioned session-memory diff artifact.
-- **FieldChecker:** a low-cost read-only LLM agent that reads the referenced revision-or-diff source artifact and invocation prompt from Hoonsoo MCP session memory, identifies the document field and the relevant content and grammar review scope, then stores a versioned field-analysis artifact.
-- **Main Reviewer:** a capable read-only LLM agent that reads the review bundle from Hoonsoo MCP session memory, considers the current diff, FieldChecker analysis, invocation prompt, and relevant previously published feedback, then stores a natural-language feedback draft.
-- **Session Orchestrator:** manages lifecycle, stale-result gates, artifact IDs, presentation, and waiting. It does not reread the document, copy artifact bodies into agent tasks, or perform a second document review.
+## Runtime tools
 
-On Codex, request `gpt-5.6-luna` with low reasoning for FieldChecker and `gpt-5.6-sol` with high reasoning for Main Reviewer when model-selectable subagents are available. On Claude Code, use the plugin-provided `hoonsoo-field-checker` agent, which requests `haiku` with low effort, and `hoonsoo-advisor`, which requests `fable` with high effort. If the host cannot create either configured agent, use the current host model for that stage and mention the fallback once.
+The Hoonsoo MCP exposes exactly this fast-path surface:
 
-Never call a model API directly or require an API key from this skill. Model routing is host-capability-gated.
+- `start_monitor`: start or reuse one target monitor and capture internal revision zero.
+- `read_review_context`: return prompt, bounded current context, current revision or aggregate diff, relevant prior feedback, and a short-lived review token in one call.
+- `publish_feedback`: atomically validate the review token, revision, and content hash, store the feedback in session memory, and mark it published.
+- `wait_for_save`: wait locally for a saved revision or lifecycle event.
+- `get_status`: use only for cancellation, error diagnosis, or recovery; it is not part of the normal review path.
+- `stop_monitor`: stop the monitor and release timers and session memory.
 
-## Session-memory contract
-
-The Hoonsoo MCP runtime is authoritative for all revision and artifact identities. It stores these only for the active runtime session:
-
-```text
-revision snapshot -> diff artifact -> field-analysis artifact -> feedback artifact
-```
-
-Each downstream artifact must record the exact upstream revision and content or artifact hash it was derived from. A store operation must reject an obsolete revision or mismatched upstream hash. Previously published feedback remains versioned in session memory so Main Reviewer can avoid repeating unaffected advice.
-
-The runtime may expose these tools:
-
-- `start_monitor`: start or reuse a monitor and create the version-zero snapshot, revision source artifact, and immutable invocation-prompt reference.
-- `read_revision`: page through a versioned snapshot when a stage genuinely requires broader context.
-- `wait_for_save`: wait locally for a saved content revision or lifecycle event. Omit timeout during normal monitoring.
-- `read_diff_artifact`: let FieldChecker or Main Reviewer page through the changed ranges and changed text directly.
-- `store_field_analysis`: store FieldChecker output against its exact revision and revision-or-diff source artifact.
-- `read_field_analysis`: read a versioned field-analysis artifact directly.
-- `read_review_bundle`: let Main Reviewer read the invocation prompt, current source reference and excerpt, field analysis, and relevant previously published feedback directly.
-- `store_feedback_draft`: store Main Reviewer natural-language advice against its exact upstream artifacts.
-- `read_feedback_artifact`: let the Orchestrator read the final draft for presentation without receiving it through an agent task message.
-- `mark_feedback_published`: acknowledge that the exact feedback artifact passed the stale gate and was shown to the user.
-- `get_status`: validate the latest runtime-observed revision, raw content hash, artifact readiness, and terminal state.
-- `stop_monitor`: stop the monitor and release timers and session artifacts.
-
-If these tools are unavailable, report that the plugin must be installed or reloaded. Do not simulate continuous monitoring with repeated shell or filesystem calls.
-
-## Reference-only delegation
-
-Never copy document text, snapshot pages, diff text, field analysis, prior feedback, or a draft into an inter-agent task message. Pass only the minimum artifact reference required by the stage.
-
-FieldChecker receives a contract like:
-
-```text
-monitorId: <monitor id>
-revision: <saved revision>
-contentHash: <raw content hash>
-sourceArtifactId: <versioned revision or diff artifact id>
-promptRef: <session prompt reference>
-```
-
-Main Reviewer receives a contract like:
-
-```text
-monitorId: <monitor id>
-revision: <saved revision>
-contentHash: <raw content hash>
-fieldArtifactId: <versioned field-analysis artifact id>
-sourceArtifactId: <the exact source artifact used by FieldChecker>
-```
-
-Each agent reads its inputs directly from Hoonsoo MCP session memory, stores its result there, and returns only its new artifact ID, revision, and hash. The Orchestrator must not ask an agent to paste or summarize artifact contents in its final task response.
+If these tools are unavailable, report that the plugin must be installed or reloaded. Do not simulate monitoring with repeated shell or filesystem calls.
 
 ## Baseline workflow
 
-Revision zero uses the same two LLM stages as later saves.
+1. Call `start_monitor` with the absolute path and invocation prompt.
+2. Call `read_review_context` for the returned monitor. This starts an analysis lease, which pauses idle warning and shutdown while review is in progress.
+3. Using only that bundle, perform one direct, combined content-and-grammar review with the current host model.
+4. Call `publish_feedback` with the exact `reviewToken`, `revision`, `contentHash`, and natural-language feedback. This compare-and-set operation rejects obsolete work and restarts the idle clock at publication.
+5. If publication succeeds, show the exact feedback using the output format below.
+6. Call `wait_for_save` with `afterRevision` equal to the last published revision and `timeoutMs: 45000`.
 
-1. Call `start_monitor` with the resolved path and invocation prompt. Retain the returned monitor ID, revision-zero content hash, revision artifact ID as the baseline source, and prompt reference.
-2. Delegate only those references to FieldChecker. It reads the baseline revision and prompt through Hoonsoo MCP, calls `store_field_analysis`, and returns only the field artifact reference.
-3. Validate the revision and hashes with `get_status`. Discard stale work rather than publishing it.
-4. Delegate only the source and field artifact references plus revision identity to Main Reviewer. It calls `read_review_bundle`, uses `read_revision` if a bounded excerpt needs broader context, creates combined content-and-grammar advice, calls `store_feedback_draft`, and returns only the feedback artifact reference.
-5. Apply the stale-result gate again. If valid, call `read_feedback_artifact`, present its text in the numbered format, then call `mark_feedback_published` for that exact artifact with the `publishedRevision` last returned by `get_status` as `expectedPublishedRevision`.
-6. Call `wait_for_save` using the last published revision and omit timeout.
+The 45-second wait stays below the normal 60-second MCP tool timeout. A plain timeout produces no user-visible message; immediately call the same wait again. This small tool-call cost is intentional and prevents a host timeout from breaking the monitor.
 
 ## Saved-revision loop
 
-For each saved revision returned by `wait_for_save`:
+For every saved revision event:
 
-1. Retain only the event's revision, raw content hash, revision artifact reference, and diff artifact reference. Use the diff artifact as `sourceArtifactId`. If `rebaselineRequired` is true or no diff artifact is available because older history was pruned, use the current revision artifact as the source instead. Do not relay its content.
-2. Run FieldChecker and Main Reviewer sequentially through their session artifacts, exactly as for revision zero.
-3. Call `get_status` before each delegation and immediately before output.
-4. Read and publish the feedback artifact only if its complete upstream chain still matches the current saved revision.
-5. Mark the exact artifact published, then wait again with no timeout.
+1. Call `read_review_context` for the newest revision. The bundle contains either its aggregate changed ranges or, when rebaselining is required, bounded current-document context.
+2. Perform exactly one direct combined review.
+3. Call `publish_feedback` with the exact token, revision, and hash.
+4. On success, display the numbered feedback and wait again with `timeoutMs: 45000`.
 
-If another save supersedes a revision while either LLM stage is running, discard the obsolete result. Do not mark it published or merge it with another revision. Restart from the newest runtime-provided artifact chain. The runtime may preserve superseded snapshots and artifacts for session history, but only current revision advice reaches the user.
+If `publish_feedback` rejects a stale token because a newer save arrived, do not display or merge the obsolete result. Immediately call `read_review_context` for the newest revision and review that bundle. Do not call `get_status` merely to preflight a publish; the publish operation is the authoritative gate.
 
-## Idle and terminal states
+## Analysis lease and idle lifecycle
 
-The idle clock resets only for a raw-content-changing saved revision. Keep the existing lifecycle:
+Reading review context issues an internal lease. While the lease is active, idle warning and automatic stop are paused. A successful publish ends the lease and starts a fresh idle period. If a review is abandoned, the bounded lease expires and the idle clock starts then, so the monitor cannot remain alive forever.
 
-- After 60 seconds without such a save, output this notice exactly once and wait again with no timeout:
+While waiting after publication:
+
+- After 60 seconds without a raw-content-changing save, output this notice exactly once:
 
   ```text
   {n} 번째 훈수 :
@@ -142,39 +98,29 @@ The idle clock resets only for a raw-content-changing saved revision. Keep the e
   추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.
   ```
 
-- After another 30 seconds without a saved content revision, end the run. Do not restart automatically.
+- After another 30 seconds without a changed save, end the run.
 - If the target is deleted or unreadable, report it once and stop.
 - On explicit cancellation, call `stop_monitor` before responding.
-- On a cancelled wait caused by unrelated new user input, inspect that request and `get_status`; stop only when the user intended to cancel.
-- A diagnostic timeout must not produce a heartbeat. Resume with a no-timeout wait.
+- On an unrelated user interruption, inspect the request before deciding whether to stop.
 
-Waiting is local runtime work and must not poll through repeated model turns. Only a saved revision or lifecycle event should wake the Orchestrator.
-
-## Stale-result gate
-
-- Bind every diff, field analysis, feedback draft, and displayed batch to one revision and raw content hash.
-- Validate the complete artifact chain against the latest runtime-observed revision immediately before presentation.
-- Reject any field or feedback artifact whose upstream ID or hash differs from current runtime status.
-- Never acknowledge, publish, combine, or repeat an obsolete result.
-- Mark a feedback artifact published only after its exact text was presented successfully.
+Waiting happens inside the local runtime. Never create visible heartbeat messages for the 45-second diagnostic timeout.
 
 ## Natural-language output
 
-Maintain a one-based batch counter. For review feedback, use:
+Maintain a one-based batch counter. For feedback, use only:
 
 ```text
 {n} 번째 훈수 :
-revision: {revision}
 
-현재 저장본에서 확인한 내용과 문법상의 문제를 사람이 설명하듯 자연스럽게 서술합니다. 왜 중요한지와 사용자가 취할 수 있는 구체적인 조치를 문장 안에 함께 담습니다.
+현재 저장본에서 확인한 내용과 문법상의 문제를 사람이 설명하듯 자연스럽게 서술합니다. 왜 중요한지와 사용자가 취할 수 있는 구체적인 조치를 함께 담습니다.
 ```
 
-Display `revision:` but do not expose `anchor:`, `category:`, `severity:`, `message:`, `rationale:`, `suggestedAction:`, `confidence:`, or internal artifact fields as key-value output. Multiple findings may use readable paragraphs or a numbered list. If there is nothing actionable, say so briefly rather than inventing a problem.
+Do not display `revision:` or any internal revision, token, hash, artifact, model, routing, or key-value field. Do not expose `anchor:`, `category:`, `severity:`, `message:`, `rationale:`, `suggestedAction:`, or `confidence:`. Multiple findings may use readable paragraphs or a short numbered list. If nothing is actionable, say so briefly.
 
-## Optional context tools
+## Optional context
 
-Hoonsoo requires no plugin beyond its own MCP. If grounded advice genuinely needs external context, use an already connected read-only source or recommend it once: GitHub or GitLab for repository context, Atlassian Rovo for issues and wiki material, Figma for screen specifications, Google Drive, Dropbox, or Box for related documents, and authoritative official documentation for current APIs. Never auto-install or connect another plugin.
+Hoonsoo needs no plugin beyond its own MCP. If grounded advice genuinely needs external context, use an already connected read-only source or recommend it once: GitHub or GitLab for repository context, Atlassian Rovo for issues and wiki material, Figma for screen specifications, Google Drive, Dropbox, or Box for related documents, and authoritative official documentation for current APIs. Never install or connect another plugin automatically.
 
 ## Stop conditions
 
-Stop on explicit user cancellation, target deletion or unreadability, runtime failure, session end, or the 90-second idle stop. On a controllable stop, call `stop_monitor`. Monitoring cannot continue after the host ends the active turn; a later run must invoke Hoonsoo again.
+Stop on explicit cancellation, target deletion or unreadability, runtime failure, session end, or the idle stop. On a controllable stop, call `stop_monitor`. A later run must invoke Hoonsoo again.

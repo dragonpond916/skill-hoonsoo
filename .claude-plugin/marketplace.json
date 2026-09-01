@@ -8,7 +8,7 @@
     {
       "name": "skill-hoonsoo",
       "source": "./plugins/skill-hoonsoo",
-      "description": "Read-only combined content and grammar review for saved document revisions"
+      "description": "Fast single-pass read-only content and grammar review for saved document revisions"
     }
   ]
 }

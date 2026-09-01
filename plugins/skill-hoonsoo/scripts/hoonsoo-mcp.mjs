@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -15,11 +15,12 @@ export const MAX_SNAPSHOT_CHARACTERS = 65_536;
 export const MAX_DELTA_CHARACTERS = 24_000;
 export const DEFAULT_IDLE_WARNING_MS = 60_000;
 export const DEFAULT_IDLE_STOP_MS = 90_000;
+export const DEFAULT_REVIEW_LEASE_MS = 180_000;
 export const IDLE_WARNING_MESSAGE =
   "1분 간, 작업이 감지되지 않습니다. 추가 30초 대기 후, 훈수모드가 정지됩니다.\n" +
   "추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.";
 
-const DEFAULT_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_POLL_INTERVAL_MS = 250;
 const READ_RETRY_DELAY_MS = 25;
 const DEFAULT_CONTEXT_LINES = 5;
 const MAX_EVENT_HISTORY = 64;
@@ -39,7 +40,7 @@ const MAX_REVIEW_HISTORY_ITEMS = 10;
 const MAX_REVIEW_HISTORY_CHARACTERS = 24_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const SERVER_NAME = "hoonsoo";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.4.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const TOOL_DEFINITIONS = [
@@ -58,7 +59,7 @@ const TOOL_DEFINITIONS = [
           maxLength: MAX_PROMPT_CHARACTERS,
           description: "Optional combined content-and-grammar review instruction.",
         },
-        pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 2_000 },
+        pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 250 },
         contextLines: { type: "integer", minimum: 0, maximum: 50, default: 5 },
       },
     },
@@ -71,28 +72,49 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "read_revision",
+    name: "read_review_context",
     description:
-      "Read one bounded page from an exact in-memory document revision. Revision 0 is the baseline.",
+      "Read one current, bounded inline-review context and acquire a time-bounded analysis lease. Use it from the current host; do not delegate the review to a subagent.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["monitorId", "revision"],
+      required: ["monitorId"],
       properties: {
         monitorId: { type: "string" },
-        revision: { type: "integer", minimum: 0 },
-        offset: { type: "integer", minimum: 0, default: 0 },
-        maxCharacters: {
+        revision: {
           type: "integer",
-          minimum: 1,
-          maximum: MAX_SNAPSHOT_CHARACTERS,
-          default: DEFAULT_SNAPSHOT_CHARACTERS,
+          minimum: 0,
+          description: "Optional current-revision CAS assertion. Omit to select the latest revision.",
         },
       },
     },
     annotations: {
-      title: "Read Hoonsoo revision",
-      readOnlyHint: true,
+      title: "Read Hoonsoo inline review context",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "publish_feedback",
+    description:
+      "CAS-validate one inline review lease, atomically publish feedback, and restart the user-idle clock.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["monitorId", "reviewToken", "revision", "contentHash", "feedback"],
+      properties: {
+        monitorId: { type: "string" },
+        reviewToken: { type: "string" },
+        revision: { type: "integer", minimum: 0 },
+        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        feedback: { type: "string", minLength: 1, maxLength: MAX_FEEDBACK_CHARACTERS },
+      },
+    },
+    annotations: {
+      title: "Publish Hoonsoo inline feedback",
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
@@ -120,203 +142,6 @@ const TOOL_DEFINITIONS = [
     annotations: {
       title: "Wait for Hoonsoo save",
       readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "read_diff_artifact",
-    description: "Read one bounded page from a versioned in-memory diff excerpt.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["monitorId", "diffArtifactId"],
-      properties: {
-        monitorId: { type: "string" },
-        diffArtifactId: { type: "string" },
-        offset: { type: "integer", minimum: 0, default: 0 },
-        maxCharacters: {
-          type: "integer",
-          minimum: 1,
-          maximum: MAX_SNAPSHOT_CHARACTERS,
-          default: DEFAULT_SNAPSHOT_CHARACTERS,
-        },
-      },
-    },
-    annotations: {
-      title: "Read Hoonsoo diff artifact",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "store_field_analysis",
-    description:
-      "CAS-validate and store FieldChecker's analysis in session memory. The user document is never modified.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "monitorId",
-        "revision",
-        "contentHash",
-        "sourceArtifactId",
-        "field",
-        "analysis",
-      ],
-      properties: {
-        monitorId: { type: "string" },
-        revision: { type: "integer", minimum: 0 },
-        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
-        sourceArtifactId: { type: "string" },
-        field: { type: "string", minLength: 1, maxLength: MAX_FIELD_CHARACTERS },
-        analysis: { type: "string", minLength: 1, maxLength: MAX_ANALYSIS_CHARACTERS },
-      },
-    },
-    annotations: {
-      title: "Store Hoonsoo field analysis",
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "read_field_analysis",
-    description: "Read one exact versioned FieldChecker artifact from session memory.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["monitorId", "fieldArtifactId"],
-      properties: {
-        monitorId: { type: "string" },
-        fieldArtifactId: { type: "string" },
-      },
-    },
-    annotations: {
-      title: "Read Hoonsoo field analysis",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "read_review_bundle",
-    description:
-      "CAS-validate and assemble the prompt, FieldChecker result, current excerpt, and recent published feedback for Main Agent.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "monitorId",
-        "revision",
-        "contentHash",
-        "sourceArtifactId",
-        "fieldArtifactId",
-      ],
-      properties: {
-        monitorId: { type: "string" },
-        revision: { type: "integer", minimum: 0 },
-        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
-        sourceArtifactId: { type: "string" },
-        fieldArtifactId: { type: "string" },
-        feedbackLimit: {
-          type: "integer",
-          minimum: 0,
-          maximum: MAX_REVIEW_HISTORY_ITEMS,
-          default: 3,
-        },
-      },
-    },
-    annotations: {
-      title: "Read Hoonsoo review bundle",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "store_feedback_draft",
-    description:
-      "CAS-validate and store Main Agent's feedback draft in session memory. The user document is never modified.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "monitorId",
-        "revision",
-        "contentHash",
-        "sourceArtifactId",
-        "fieldArtifactId",
-        "feedback",
-      ],
-      properties: {
-        monitorId: { type: "string" },
-        revision: { type: "integer", minimum: 0 },
-        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
-        sourceArtifactId: { type: "string" },
-        fieldArtifactId: { type: "string" },
-        feedback: { type: "string", minLength: 1, maxLength: MAX_FEEDBACK_CHARACTERS },
-      },
-    },
-    annotations: {
-      title: "Store Hoonsoo feedback draft",
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "read_feedback_artifact",
-    description: "Read one exact versioned feedback draft or published feedback artifact.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["monitorId", "feedbackArtifactId"],
-      properties: {
-        monitorId: { type: "string" },
-        feedbackArtifactId: { type: "string" },
-      },
-    },
-    annotations: {
-      title: "Read Hoonsoo feedback artifact",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "mark_feedback_published",
-    description:
-      "CAS-mark one feedback artifact as published and advance publishedRevision in session memory.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "monitorId",
-        "feedbackArtifactId",
-        "revision",
-        "contentHash",
-        "expectedPublishedRevision",
-      ],
-      properties: {
-        monitorId: { type: "string" },
-        feedbackArtifactId: { type: "string" },
-        revision: { type: "integer", minimum: 0 },
-        contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
-        expectedPublishedRevision: { type: "integer", minimum: -1 },
-      },
-    },
-    annotations: {
-      title: "Publish Hoonsoo feedback",
-      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
@@ -967,6 +792,13 @@ export class MonitorSession {
     if (this.idleStopMs <= this.idleWarningMs) {
       throw new HoonsooError("INVALID_ARGUMENT", "idleStopMs must be greater than idleWarningMs.");
     }
+    this.reviewLeaseMs = integerOption(
+      args.reviewLeaseMs,
+      "reviewLeaseMs",
+      DEFAULT_REVIEW_LEASE_MS,
+      1,
+      24 * 60 * 60 * 1_000,
+    );
     this.now = args.now ?? Date.now;
     if (typeof this.now !== "function") {
       throw new HoonsooError("INVALID_ARGUMENT", "now must be a function.");
@@ -986,6 +818,37 @@ export class MonitorSession {
       MAX_PROMPT_CHARACTERS,
       true,
     );
+    const activeId = this.activeByPath.get(targetPath);
+    const active = activeId ? this.monitors.get(activeId) : undefined;
+    if (active?.status === "active") {
+      if (args.prompt !== undefined && prompt !== active.prompt) {
+        throw new HoonsooError(
+          "MONITOR_PROMPT_CONFLICT",
+          "An active monitor keeps one immutable invocation prompt. Stop it before starting the same target with a different prompt.",
+        );
+      }
+      if (args.pollIntervalMs !== undefined) {
+        active.pollIntervalMs = integerOption(
+          args.pollIntervalMs,
+          "pollIntervalMs",
+          active.pollIntervalMs,
+          25,
+          60_000,
+        );
+        this.#restartPollTimer(active);
+      }
+      if (args.contextLines !== undefined) {
+        active.contextLines = integerOption(
+          args.contextLines,
+          "contextLines",
+          active.contextLines,
+          0,
+          50,
+        );
+      }
+      return { ...this.#status(active), reused: true };
+    }
+
     const pollIntervalMs = integerOption(
       args.pollIntervalMs,
       "pollIntervalMs",
@@ -1000,21 +863,6 @@ export class MonitorSession {
       0,
       50,
     );
-
-    const activeId = this.activeByPath.get(targetPath);
-    const active = activeId ? this.monitors.get(activeId) : undefined;
-    if (active?.status === "active") {
-      if (args.prompt !== undefined && prompt !== active.prompt) {
-        throw new HoonsooError(
-          "MONITOR_PROMPT_CONFLICT",
-          "An active monitor keeps one immutable invocation prompt. Stop it before starting the same target with a different prompt.",
-        );
-      }
-      active.pollIntervalMs = pollIntervalMs;
-      active.contextLines = contextLines;
-      this.#restartPollTimer(active);
-      return { ...this.#status(active), reused: true };
-    }
 
     const snapshot = await readStablePath(targetPath, READ_RETRY_DELAY_MS);
     const startedAtMs = this.now();
@@ -1058,6 +906,7 @@ export class MonitorSession {
       waiters: new Set(),
       pollTimer: null,
       idleTimer: null,
+      reviewLease: null,
       polling: false,
       missingProbes: 0,
     };
@@ -1098,6 +947,204 @@ export class MonitorSession {
       prompt: monitor.prompt,
       metadata: publicMetadata(artifact.snapshot.metadata),
       ...pageText(artifact.snapshot.text, offset, maxCharacters),
+    };
+  }
+
+  readReviewContext(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const revision =
+      args.revision === undefined
+        ? monitor.revision
+        : integerOption(
+            args.revision,
+            "revision",
+            undefined,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          );
+    if (revision !== monitor.revision) {
+      throw new HoonsooError(
+        "STALE_REVISION",
+        "The latest review target is revision " + monitor.revision + ".",
+      );
+    }
+    const current = this.#assertCurrentRevision(
+      monitor,
+      revision,
+      monitor.currentContentHash,
+    );
+    const { source, rebaselineRequired } = this.#selectReviewSource(
+      monitor,
+      revision,
+      current,
+    );
+    const sourceArtifactId = source.artifact.id;
+    const previousReviewToken = monitor.reviewLease?.token;
+    const lease = this.#acquireReviewLease(
+      monitor,
+      revision,
+      current.contentHash,
+      sourceArtifactId,
+    );
+    const excerpt =
+      source.kind === "diff"
+        ? {
+            content: source.artifact.excerpt,
+            truncated: source.artifact.delta.truncated,
+            changedRanges: source.artifact.changedRanges,
+          }
+        : {
+            content: current.snapshot.text.slice(0, MAX_DELTA_TEXT_CHARACTERS),
+            truncated: current.snapshot.text.length > MAX_DELTA_TEXT_CHARACTERS,
+            changedRanges: [
+              {
+                startLine: 1,
+                endLine: Math.max(1, countLines(current.snapshot.text)),
+              },
+            ],
+          };
+    const documentContent = current.snapshot.text.slice(
+      0,
+      DEFAULT_SNAPSHOT_CHARACTERS,
+    );
+
+    return {
+      state: "review-ready",
+      monitorId: monitor.id,
+      reviewToken: lease.token,
+      revision,
+      contentHash: current.contentHash,
+      prompt: monitor.prompt,
+      sourceArtifactId,
+      sourceKind: source.kind,
+      excerpt,
+      documentContext: {
+        content: documentContent,
+        truncated: documentContent.length < current.snapshot.text.length,
+        totalCharacters: current.snapshot.text.length,
+      },
+      recentPublishedFeedback: this.#recentPublishedFeedback(monitor, revision, 3),
+      publishedRevision: monitor.publishedRevision,
+      rebaselineRequired,
+      leaseExpiresAt: new Date(lease.expiresAtMs).toISOString(),
+      reused: previousReviewToken === lease.token,
+    };
+  }
+
+  publishFeedback(input) {
+    const args = assertObject(input);
+    const monitor = this.#requireMonitor(args.monitorId);
+    const reviewToken = requireString(args.reviewToken, "reviewToken");
+    const revision = integerOption(
+      args.revision,
+      "revision",
+      undefined,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const contentHash = requireString(args.contentHash, "contentHash");
+    const feedback = this.#boundedString(
+      args.feedback,
+      "feedback",
+      MAX_FEEDBACK_CHARACTERS,
+    );
+
+    this.#assertCurrentRevision(monitor, revision, contentHash);
+    const completed = [...monitor.feedbackArtifacts.values()].find(
+      (artifact) => artifact.reviewToken === reviewToken,
+    );
+    if (completed) {
+      if (
+        completed.revision === revision &&
+        completed.contentHash === contentHash &&
+        completed.feedback === feedback &&
+        completed.state === "published"
+      ) {
+        return {
+          state: "published",
+          monitorId: monitor.id,
+          reviewToken,
+          ...this.#publicFeedbackArtifact(completed),
+          publishedRevision: monitor.publishedRevision,
+          reused: true,
+        };
+      }
+      throw new HoonsooError(
+        "FEEDBACK_PUBLISH_CONFLICT",
+        "The review token was already consumed by different feedback.",
+      );
+    }
+
+    const lease = monitor.reviewLease;
+    if (!lease || lease.token !== reviewToken) {
+      throw new HoonsooError(
+        "REVIEW_TOKEN_INVALID",
+        "The review token is not active for this monitor.",
+      );
+    }
+    if (lease.expiresAtMs <= this.now()) {
+      this.#expireReviewLease(monitor, reviewToken);
+      throw new HoonsooError("REVIEW_LEASE_EXPIRED", "The review lease has expired.");
+    }
+    if (
+      lease.revision !== revision ||
+      lease.contentHash !== contentHash
+    ) {
+      throw new HoonsooError(
+        "ARTIFACT_REVISION_MISMATCH",
+        "The review lease does not match the requested revision and content hash.",
+      );
+    }
+    this.#requireSourceArtifact(
+      monitor,
+      lease.sourceArtifactId,
+      revision,
+      contentHash,
+    );
+    if (monitor.publishedRevision !== lease.expectedPublishedRevision) {
+      throw new HoonsooError(
+        "PUBLISHED_REVISION_CONFLICT",
+        "Published feedback advanced after this review lease was acquired.",
+      );
+    }
+
+    const existingId = monitor.feedbackArtifactByRevision.get(revision);
+    if (existingId) {
+      throw new HoonsooError(
+        "FEEDBACK_PUBLISH_CONFLICT",
+        "Different feedback already exists for revision " + revision + ".",
+      );
+    }
+
+    const publishedAtMs = this.now();
+    const publishedAt = new Date(publishedAtMs).toISOString();
+    const artifact = {
+      id: "feedback-" + monitor.id + "-" + revision,
+      revision,
+      contentHash,
+      sourceArtifactId: lease.sourceArtifactId,
+      fieldArtifactId: null,
+      reviewToken,
+      feedback,
+      state: "published",
+      createdAt: publishedAt,
+      publishedAt,
+    };
+    monitor.feedbackArtifacts.set(artifact.id, artifact);
+    monitor.feedbackArtifactByRevision.set(revision, artifact.id);
+    monitor.publishedRevision = revision;
+    monitor.publishedFeedbackIds.push(artifact.id);
+    this.#clearReviewLease(monitor);
+    this.#restartIdleClock(monitor, publishedAtMs);
+
+    return {
+      state: "published",
+      monitorId: monitor.id,
+      reviewToken,
+      ...this.#publicFeedbackArtifact(artifact),
+      publishedRevision: monitor.publishedRevision,
+      reused: false,
     };
   }
 
@@ -1191,6 +1238,7 @@ export class MonitorSession {
       monitor.waiters.add(waiter);
       signal?.addEventListener("abort", waiter.abort, { once: true });
       if (signal?.aborted) waiter.abort();
+      else void this.#poll(monitor);
     });
   }
 
@@ -1649,6 +1697,120 @@ export class MonitorSession {
     );
   }
 
+  #selectReviewSource(monitor, revision, current) {
+    if (revision === 0 || monitor.publishedRevision === revision) {
+      return {
+        source: { kind: "revision", artifact: current },
+        rebaselineRequired: false,
+      };
+    }
+    if (monitor.publishedRevision < 0) {
+      return {
+        source: { kind: "revision", artifact: current },
+        rebaselineRequired: true,
+      };
+    }
+    try {
+      return {
+        source: {
+          kind: "diff",
+          artifact: this.#createDiffArtifact(
+            monitor,
+            monitor.publishedRevision,
+            revision,
+          ),
+        },
+        rebaselineRequired: false,
+      };
+    } catch (error) {
+      if (error.code !== "REVISION_NOT_AVAILABLE") throw error;
+      return {
+        source: { kind: "revision", artifact: current },
+        rebaselineRequired: true,
+      };
+    }
+  }
+
+  #recentPublishedFeedback(monitor, revision, feedbackLimit) {
+    const recentPublishedFeedback = [];
+    let remainingCharacters = MAX_REVIEW_HISTORY_CHARACTERS;
+    const candidateIds = monitor.publishedFeedbackIds.slice(-feedbackLimit);
+    for (let index = candidateIds.length - 1; index >= 0; index -= 1) {
+      const artifact = monitor.feedbackArtifacts.get(candidateIds[index]);
+      if (!artifact || artifact.revision >= revision || remainingCharacters <= 0) continue;
+      const feedback =
+        artifact.feedback.length <= remainingCharacters
+          ? artifact.feedback
+          : artifact.feedback.slice(artifact.feedback.length - remainingCharacters);
+      remainingCharacters -= feedback.length;
+      recentPublishedFeedback.unshift({
+        feedbackArtifactId: artifact.id,
+        revision: artifact.revision,
+        feedback,
+        publishedAt: artifact.publishedAt,
+      });
+    }
+    return recentPublishedFeedback;
+  }
+
+  #acquireReviewLease(monitor, revision, contentHash, sourceArtifactId) {
+    const nowMs = this.now();
+    const currentLease = monitor.reviewLease;
+    if (
+      currentLease &&
+      currentLease.expiresAtMs > nowMs &&
+      currentLease.revision === revision &&
+      currentLease.contentHash === contentHash &&
+      currentLease.sourceArtifactId === sourceArtifactId
+    ) {
+      return currentLease;
+    }
+    this.#clearReviewLease(monitor);
+    clearTimeout(monitor.idleTimer);
+    monitor.idleTimer = null;
+    monitor.idleWarningIssued = false;
+    monitor.idleWarningPending = false;
+    monitor.idleWarningDelivered = false;
+    const lease = {
+      token: "review-" + randomUUID(),
+      revision,
+      contentHash,
+      sourceArtifactId,
+      expectedPublishedRevision: monitor.publishedRevision,
+      startedAtMs: nowMs,
+      expiresAtMs: nowMs + this.reviewLeaseMs,
+      timer: null,
+    };
+    lease.timer = setTimeout(
+      () => this.#expireReviewLease(monitor, lease.token),
+      this.reviewLeaseMs,
+    );
+    lease.timer.unref?.();
+    monitor.reviewLease = lease;
+    return lease;
+  }
+
+  #clearReviewLease(monitor) {
+    if (!monitor.reviewLease) return;
+    clearTimeout(monitor.reviewLease.timer);
+    monitor.reviewLease.timer = null;
+    monitor.reviewLease = null;
+  }
+
+  #expireReviewLease(monitor, reviewToken) {
+    if (monitor.reviewLease?.token !== reviewToken) return;
+    this.#clearReviewLease(monitor);
+    if (monitor.status === "active") this.#restartIdleClock(monitor, this.now());
+  }
+
+  #restartIdleClock(monitor, startedAtMs = this.now()) {
+    monitor.lastContentActivityAtMs = startedAtMs;
+    monitor.idleWarningIssued = false;
+    monitor.idleWarningPending = false;
+    monitor.idleWarningDelivered = false;
+    this.#scheduleIdleTimer(monitor);
+  }
+
   #assertFieldMatches(fieldArtifact, revision, contentHash, sourceArtifactId) {
     if (
       fieldArtifact.revision !== revision ||
@@ -1690,6 +1852,7 @@ export class MonitorSession {
 
   #status(monitor) {
     const current = monitor.revisionArtifacts.get(monitor.revision);
+    const lease = monitor.reviewLease;
     return {
       monitorId: monitor.id,
       path: monitor.path,
@@ -1713,6 +1876,19 @@ export class MonitorSession {
       promptRef: monitor.purged ? null : monitor.promptRef,
       idleWarningIssued: monitor.idleWarningIssued,
       idleForMs: Math.max(0, this.now() - monitor.lastContentActivityAtMs),
+      idleSuspended: Boolean(lease),
+      reviewLeaseMs: this.reviewLeaseMs,
+      reviewLease: lease
+        ? {
+            active: true,
+            revision: lease.revision,
+            contentHash: lease.contentHash,
+            sourceArtifactId: lease.sourceArtifactId,
+            startedAt: new Date(lease.startedAtMs).toISOString(),
+            expiresAt: new Date(lease.expiresAtMs).toISOString(),
+            remainingMs: Math.max(0, lease.expiresAtMs - this.now()),
+          }
+        : { active: false },
     };
   }
 
@@ -1957,16 +2133,14 @@ export class MonitorSession {
   }
 
   #markContentActivity(monitor) {
-    monitor.lastContentActivityAtMs = this.now();
-    monitor.idleWarningIssued = false;
-    monitor.idleWarningPending = false;
-    monitor.idleWarningDelivered = false;
-    this.#scheduleIdleTimer(monitor);
+    this.#clearReviewLease(monitor);
+    this.#restartIdleClock(monitor, this.now());
   }
 
   #scheduleIdleTimer(monitor) {
     clearTimeout(monitor.idleTimer);
-    if (monitor.status !== "active") return;
+    monitor.idleTimer = null;
+    if (monitor.status !== "active" || monitor.reviewLease) return;
     const elapsed = Math.max(0, this.now() - monitor.lastContentActivityAtMs);
     const threshold = monitor.idleWarningIssued ? this.idleStopMs : this.idleWarningMs;
     const delay = Math.max(1, threshold - elapsed);
@@ -1975,7 +2149,7 @@ export class MonitorSession {
   }
 
   #handleIdleTimer(monitor) {
-    if (monitor.status !== "active") return;
+    if (monitor.status !== "active" || monitor.reviewLease) return;
     const elapsed = Math.max(0, this.now() - monitor.lastContentActivityAtMs);
     if (!monitor.idleWarningIssued && elapsed >= this.idleWarningMs) {
       monitor.idleWarningIssued = true;
@@ -2025,6 +2199,7 @@ export class MonitorSession {
 
   #purge(monitor) {
     if (monitor.purged) return;
+    this.#clearReviewLease(monitor);
     monitor.prompt = "";
     monitor.promptHash = null;
     monitor.promptRef = null;
@@ -2047,6 +2222,7 @@ export class MonitorSession {
   #stop(monitor, reason, status, stateOverride = undefined) {
     clearInterval(monitor.pollTimer);
     clearTimeout(monitor.idleTimer);
+    this.#clearReviewLease(monitor);
     monitor.pollTimer = null;
     monitor.idleTimer = null;
     monitor.status = status;
@@ -2068,9 +2244,50 @@ export class MonitorSession {
     for (const waiter of [...monitor.waiters]) waiter.resolve(result);
   }
 }
+function compactToolSummary(data) {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return { ok: true };
+  }
+  if (Array.isArray(data.monitors)) {
+    return { ok: true, monitorCount: data.monitors.length };
+  }
+  const summary = { ok: true };
+  for (const key of [
+    "state",
+    "monitorId",
+    "status",
+    "reason",
+    "purged",
+    "revision",
+    "contentHash",
+    "reviewToken",
+    "sourceArtifactId",
+    "sourceKind",
+    "rebaselineRequired",
+    "feedbackArtifactId",
+    "publishedRevision",
+    "reused",
+  ]) {
+    if (Object.hasOwn(data, key)) summary[key] = data[key];
+  }
+  if (data.event && typeof data.event === "object") {
+    summary.event = {};
+    for (const key of [
+      "type",
+      "revision",
+      "contentHash",
+      "revisionArtifactId",
+      "diffArtifactId",
+    ]) {
+      if (Object.hasOwn(data.event, key)) summary.event[key] = data.event[key];
+    }
+  }
+  return summary;
+}
+
 function toolSuccess(data) {
   return {
-    content: [{ type: "text", text: JSON.stringify(data) }],
+    content: [{ type: "text", text: JSON.stringify(compactToolSummary(data)) }],
     structuredContent: data,
   };
 }
@@ -2101,32 +2318,14 @@ export async function callTool(session, name, args, signal = undefined) {
       case "start_monitor":
         result = await session.startMonitor(args);
         break;
-      case "read_revision":
-        result = session.readRevision(args);
+      case "read_review_context":
+        result = session.readReviewContext(args);
+        break;
+      case "publish_feedback":
+        result = session.publishFeedback(args);
         break;
       case "wait_for_save":
         result = await session.waitForSave(args, signal);
-        break;
-      case "read_diff_artifact":
-        result = session.readDiffArtifact(args);
-        break;
-      case "store_field_analysis":
-        result = session.storeFieldAnalysis(args);
-        break;
-      case "read_field_analysis":
-        result = session.readFieldAnalysis(args);
-        break;
-      case "read_review_bundle":
-        result = session.readReviewBundle(args);
-        break;
-      case "store_feedback_draft":
-        result = session.storeFeedbackDraft(args);
-        break;
-      case "read_feedback_artifact":
-        result = session.readFeedbackArtifact(args);
-        break;
-      case "mark_feedback_published":
-        result = session.markFeedbackPublished(args);
         break;
       case "get_status":
         result = session.getStatus(args);
@@ -2210,7 +2409,7 @@ export function createMcpServer({ input = process.stdin, output = process.stdout
               capabilities: { tools: { listChanged: false } },
               serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
               instructions:
-                "Hoonsoo only reads explicitly selected UTF-8 regular files. It never writes to the target or workspace.",
+                "Hoonsoo 0.4 uses exactly six tools in an inline current-host flow: start_monitor, read_review_context, publish_feedback, wait_for_save, get_status, and stop_monitor. The current host must perform the review itself; do not use subagents because session memory is process-local. Hoonsoo only reads explicitly selected UTF-8 regular files and never writes to the target or workspace.",
             }),
           );
           break;

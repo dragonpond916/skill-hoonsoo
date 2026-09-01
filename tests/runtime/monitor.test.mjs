@@ -6,6 +6,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  DEFAULT_REVIEW_LEASE_MS,
   IDLE_WARNING_MESSAGE,
   MAX_DELTA_CHARACTERS,
   MAX_FILE_BYTES,
@@ -140,6 +141,240 @@ test("starts with a versioned baseline and reads exact revision pages", async ()
     session.startMonitor({ path: target, prompt: "Use a different focus." }),
     (error) => error.code === "MONITOR_PROMPT_CONFLICT",
   );
+});
+
+test("uses the 250ms default poll and immediately probes after registering a waiter", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "before", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target });
+  assert.equal(started.pollIntervalMs, 250);
+  assert.equal(started.reviewLeaseMs, DEFAULT_REVIEW_LEASE_MS);
+
+  await writeFile(target, "after", "utf8");
+  const savedAt = Date.now();
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  assert.equal(saved.event.revision, 1);
+  assert.ok(Date.now() - savedAt < 500, "save detection exceeded the fast-path bound");
+
+  const reused = await session.startMonitor({ path: target });
+  assert.equal(reused.pollIntervalMs, 250);
+  const slowed = await session.startMonitor({ path: target, pollIntervalMs: 60_000 });
+  assert.equal(slowed.pollIntervalMs, 60_000);
+  const reusedWithoutOverride = await session.startMonitor({ path: target });
+  assert.equal(reusedWithoutOverride.pollIntervalMs, 60_000);
+
+  await writeFile(target, "after again", "utf8");
+  const immediateAt = Date.now();
+  const immediatelyDetected = await waitForSaved(session, started.monitorId, 1);
+  assert.equal(immediatelyDetected.event.revision, 2);
+  assert.ok(
+    Date.now() - immediateAt < 500,
+    "waiter registration did not trigger an immediate probe",
+  );
+});
+
+test("reviews and publishes directly with a revision-bound idempotent lease", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "baseline content", "utf8");
+  const session = new MonitorSession();
+  sessions.push(session);
+  const started = await session.startMonitor({
+    path: target,
+    prompt: "Check meaning and grammar.",
+    pollIntervalMs: 25,
+  });
+
+  const context = session.readReviewContext({ monitorId: started.monitorId });
+  assert.equal(context.state, "review-ready");
+  assert.equal(context.revision, 0);
+  assert.equal(context.contentHash, started.contentHash);
+  assert.equal(context.prompt, "Check meaning and grammar.");
+  assert.equal(context.sourceArtifactId, started.revisionArtifactId);
+  assert.equal(context.sourceKind, "revision");
+  assert.equal(context.rebaselineRequired, false);
+  assert.equal(context.documentContext.content, "baseline content");
+  assert.equal(context.recentPublishedFeedback.length, 0);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, true);
+
+  const repeatedContext = session.readReviewContext({
+    monitorId: started.monitorId,
+    revision: 0,
+  });
+  assert.equal(repeatedContext.reviewToken, context.reviewToken);
+  assert.equal(repeatedContext.leaseExpiresAt, context.leaseExpiresAt);
+  assert.equal(repeatedContext.reused, true);
+
+  assert.throws(() => session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: "review-foreign",
+    revision: 0,
+    contentHash: started.contentHash,
+    feedback: "foreign",
+  }), { code: "REVIEW_TOKEN_INVALID" });
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).publishedRevision, -1);
+
+  const published = session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: context.reviewToken,
+    revision: 0,
+    contentHash: started.contentHash,
+    feedback: "Baseline feedback",
+  });
+  assert.equal(published.state, "published");
+  assert.equal(published.fieldArtifactId, null);
+  assert.equal(published.feedback, "Baseline feedback");
+  assert.equal(published.publishedRevision, 0);
+  assert.equal(published.reused, false);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, false);
+
+  const retried = session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: context.reviewToken,
+    revision: 0,
+    contentHash: started.contentHash,
+    feedback: "Baseline feedback",
+  });
+  assert.equal(retried.feedbackArtifactId, published.feedbackArtifactId);
+  assert.equal(retried.reused, true);
+  assert.throws(() => session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: context.reviewToken,
+    revision: 0,
+    contentHash: started.contentHash,
+    feedback: "Different feedback",
+  }), { code: "FEEDBACK_PUBLISH_CONFLICT" });
+});
+
+test("suspends idle lifecycle during analysis and restarts it after publish", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "content", "utf8");
+  const session = new MonitorSession({
+    idleWarningMs: 70,
+    idleStopMs: 130,
+    reviewLeaseMs: 400,
+  });
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  const context = session.readReviewContext({ monitorId: started.monitorId });
+
+  await delay(160);
+  const duringAnalysis = session.getStatus({ monitorId: started.monitorId });
+  assert.equal(duringAnalysis.status, "active");
+  assert.equal(duringAnalysis.purged, false);
+  assert.equal(duringAnalysis.reviewLease.active, true);
+  assert.equal(duringAnalysis.idleSuspended, true);
+  const diagnostic = await session.waitForSave({
+    monitorId: started.monitorId,
+    afterRevision: 0,
+    timeoutMs: 20,
+  });
+  assert.equal(diagnostic.state, "timeout");
+
+  const publishedAt = Date.now();
+  session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: context.reviewToken,
+    revision: 0,
+    contentHash: context.contentHash,
+    feedback: "Finished after a long analysis",
+  });
+  const warning = await withDeadline(
+    session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+  assert.equal(warning.state, "idle-warning");
+  assert.ok(Date.now() - publishedAt >= 50, "idle clock did not restart at publish time");
+  const stopped = await withDeadline(
+    session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+  assert.equal(stopped.state, "idle-stopped");
+  assert.equal(stopped.purged, true);
+});
+
+test("expires an abandoned review lease before restarting idle time", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "content", "utf8");
+  const session = new MonitorSession({
+    idleWarningMs: 70,
+    idleStopMs: 130,
+    reviewLeaseMs: 60,
+  });
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  const context = session.readReviewContext({ monitorId: started.monitorId });
+
+  await delay(85);
+  const expired = session.getStatus({ monitorId: started.monitorId });
+  assert.equal(expired.status, "active");
+  assert.equal(expired.reviewLease.active, false);
+  assert.equal(expired.idleSuspended, false);
+  assert.ok(expired.idleForMs < 60, "idle clock did not restart when the lease expired");
+  assert.throws(() => session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: context.reviewToken,
+    revision: 0,
+    contentHash: context.contentHash,
+    feedback: "too late",
+  }), { code: "REVIEW_TOKEN_INVALID" });
+
+  const warning = await withDeadline(
+    session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
+  );
+  assert.equal(warning.state, "idle-warning");
+});
+
+test("makes an old review lease stale when a newer save is observed", async () => {
+  const directory = await temporaryDirectory();
+  const target = path.join(directory, "document.md");
+  await writeFile(target, "zero", "utf8");
+  const session = new MonitorSession({ reviewLeaseMs: 500 });
+  sessions.push(session);
+  const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  const baseline = session.readReviewContext({ monitorId: started.monitorId });
+  session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: baseline.reviewToken,
+    revision: 0,
+    contentHash: baseline.contentHash,
+    feedback: "baseline feedback",
+  });
+  const oldLease = session.readReviewContext({ monitorId: started.monitorId, revision: 0 });
+
+  await writeFile(target, "one", "utf8");
+  const saved = await waitForSaved(session, started.monitorId, 0);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, false);
+  assert.throws(() => session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: oldLease.reviewToken,
+    revision: 0,
+    contentHash: oldLease.contentHash,
+    feedback: "obsolete feedback",
+  }), { code: "STALE_REVISION" });
+
+  const latest = session.readReviewContext({
+    monitorId: started.monitorId,
+    revision: saved.event.revision,
+  });
+  assert.equal(latest.sourceKind, "diff");
+  assert.equal(latest.sourceArtifactId, saved.event.diffArtifactId);
+  assert.equal(latest.rebaselineRequired, false);
+  assert.deepEqual(
+    latest.recentPublishedFeedback.map(({ revision, feedback }) => ({ revision, feedback })),
+    [{ revision: 0, feedback: "baseline feedback" }],
+  );
+  const published = session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: latest.reviewToken,
+    revision: latest.revision,
+    contentHash: latest.contentHash,
+    feedback: "revision one feedback",
+  });
+  assert.equal(published.publishedRevision, 1);
 });
 
 test("rejects non-files, oversized files, and invalid UTF-8", async () => {

@@ -1,17 +1,17 @@
 {
   "$schema": "../schemas/hoonsoo.manifest.schema.json",
-  "schemaVersion": "0.3.0",
+  "schemaVersion": "0.4.0",
   "kind": "HoonsooSkill",
   "metadata": {
     "name": "hoonsoo",
     "displayName": "Hoonsoo",
-    "version": "0.3.0-alpha.1",
-    "description": "Review both document content and grammar after stable saved states without modifying the source file.",
+    "version": "0.4.0-alpha.1",
+    "description": "Review document content and grammar in one current-host pass after stable saved states without modifying the source file.",
     "keywords": [
       "advice-only",
       "save-triggered-review",
-      "versioned-artifacts",
-      "document-review"
+      "single-host-review",
+      "fast-path"
     ]
   },
   "skill": {
@@ -55,8 +55,8 @@
       "versionedCollections": [
         "revisionSnapshots",
         "diffArtifacts",
-        "fieldArtifacts",
-        "feedbackArtifacts"
+        "feedbackArtifacts",
+        "reviewLeases"
       ]
     }
   },
@@ -76,7 +76,7 @@
   },
   "watch": {
     "mode": "metadata-polling",
-    "pollIntervalMs": 2000,
+    "pollIntervalMs": 250,
     "throttling": {
       "enabled": false
     },
@@ -105,7 +105,7 @@
       "role": "save-monitor",
       "implementation": "deterministic-worker",
       "modelClass": "none",
-      "responsibility": "Detect metadata changes, confirm a stable disk snapshot, and distinguish save activity from content revisions.",
+      "responsibility": "Detect metadata changes, capture a stable disk snapshot, and distinguish save activity from content revisions.",
       "inputs": [
         "target-path",
         "save-detection-policy"
@@ -120,9 +120,9 @@
       "role": "revision-diff-checker",
       "implementation": "deterministic-worker",
       "modelClass": "none",
-      "responsibility": "Version every changed stable snapshot and store bounded changed excerpts and line ranges as session artifacts.",
+      "responsibility": "Version each changed stable snapshot and store bounded aggregate changed excerpts and line ranges.",
       "inputs": [
-        "previous-revision-snapshot",
+        "last-published-revision-snapshot",
         "current-stable-snapshot"
       ],
       "outputs": [
@@ -131,59 +131,45 @@
       ],
       "effectPolicy": "compute-and-update-session-memory-only"
     },
-    "fieldCheckAgent": {
-      "role": "field-checker",
-      "implementation": "llm-agent",
-      "modelClass": "efficient",
-      "responsibility": "Read the referenced revision or diff artifact, identify the document domain, type, language, intent, and useful content and grammar review focus, then store a versioned field artifact.",
-      "inputs": [
-        "monitor-reference",
-        "revision-artifact-reference",
-        "diff-artifact-reference",
-        "prompt-reference"
-      ],
-      "outputs": [
-        "field-artifact-reference"
-      ],
-      "effectPolicy": "read-target-artifacts-and-update-session-memory-only"
-    },
-    "mainReviewAgent": {
+    "combinedReviewAgent": {
       "role": "combined-reviewer",
-      "implementation": "llm-agent",
-      "modelClass": "flagship",
-      "responsibility": "Read the field artifact, current revision changes, invocation prompt, and relevant published feedback, then store one combined content and grammar feedback draft.",
+      "implementation": "current-host",
+      "modelClass": "current-host",
+      "responsibility": "Read one review context and produce combined content and grammar advice in a single current-host model pass without spawning a subagent.",
       "inputs": [
-        "field-artifact-reference",
-        "review-bundle-reference"
+        "review-context",
+        "invocation-prompt",
+        "recent-published-feedback"
       ],
       "outputs": [
-        "feedback-artifact-reference"
+        "natural-language-feedback"
       ],
-      "effectPolicy": "read-target-artifacts-and-update-session-memory-only"
+      "effectPolicy": "advice-only-no-file-mutation"
     },
     "revisionGate": {
       "role": "revision-gate",
       "implementation": "deterministic-worker",
       "modelClass": "none",
-      "responsibility": "Reject field or feedback writes whose revision, content hash, or source artifact no longer matches the current monitor state.",
+      "responsibility": "Reject feedback whose review lease, revision, content hash, or source artifact no longer matches current monitor state.",
       "inputs": [
-        "artifact-reference",
+        "review-lease",
+        "feedback",
         "runtime-status"
       ],
       "outputs": [
-        "accepted-artifact",
+        "published-feedback",
         "stale-decision"
       ],
-      "effectPolicy": "validate-session-memory-only"
+      "effectPolicy": "validate-and-update-session-memory-only"
     },
     "idleGuard": {
       "role": "idle-guard",
       "implementation": "deterministic-worker",
       "modelClass": "none",
-      "responsibility": "Reset on a content-changing saved revision, warn once after 60 seconds without content change, and stop after 90 seconds.",
+      "responsibility": "Pause idle time while a review lease is active, then restart it after feedback publication or lease expiry.",
       "inputs": [
-        "last-content-revision",
-        "idle-policy"
+        "review-lease-state",
+        "last-content-revision"
       ],
       "outputs": [
         "idle-warning",
@@ -195,10 +181,11 @@
       "role": "host-session-orchestrator",
       "implementation": "host-agent",
       "modelClass": "current-host",
-      "responsibility": "Pass artifact references between stages, validate the latest revision, publish stored natural-language feedback, mark it published, and resume a no-timeout wait.",
+      "responsibility": "Manage monitor lifecycle, request one inline review, publish accepted natural-language feedback, and perform bounded waits with silent retries.",
       "inputs": [
-        "artifact-references",
-        "runtime-status"
+        "runtime-status",
+        "review-context",
+        "published-feedback"
       ],
       "outputs": [
         "numbered-advice-batch"
@@ -210,44 +197,44 @@
     "sequence": [
       "monitoringAgent",
       "diffCheckAgent",
-      "fieldCheckAgent",
-      "mainReviewAgent",
+      "combinedReviewAgent",
       "revisionGate",
       "sessionOrchestrator"
     ],
     "baseline": {
-      "revision": 0,
-      "fieldInput": "full-revision-artifact",
-      "review": "combined-content-and-grammar"
+      "internalRevision": 0,
+      "reviewInput": "full-revision-context"
     },
     "savedRevision": {
-      "fieldInput": "diff-artifact",
-      "reviewInput": "review-bundle",
-      "review": "combined-content-and-grammar"
+      "reviewInput": "aggregate-diff-context"
     },
+    "reviewPassesPerRevision": 1,
+    "reviewExecution": "current-host-inline",
+    "subagentPolicy": "forbidden",
     "backlogPolicy": "latest-revision-wins-with-aggregate-diff-from-last-published",
-    "staleResultPolicy": "reject-by-revision-content-hash-and-artifact-id",
-    "interAgentPayload": "artifact-references-only",
-    "normalWait": "event-driven-without-timeout"
+    "staleResultPolicy": "reject-by-review-lease-revision-content-hash-and-source",
+    "reviewLease": {
+      "defaultMs": 180000,
+      "idleClockWhileActive": "paused",
+      "idleClockResumeOn": [
+        "feedback-published",
+        "lease-expired"
+      ]
+    },
+    "normalWait": {
+      "timeoutMs": 45000,
+      "hostToolDefaultMs": 60000,
+      "onTimeout": "silent-retry"
+    }
   },
   "mcpTools": {
-    "monitoring": [
+    "public": [
       "start_monitor",
+      "read_review_context",
+      "publish_feedback",
       "wait_for_save",
       "get_status",
       "stop_monitor"
-    ],
-    "artifactReads": [
-      "read_revision",
-      "read_diff_artifact",
-      "read_field_analysis",
-      "read_review_bundle",
-      "read_feedback_artifact"
-    ],
-    "sessionWrites": [
-      "store_field_analysis",
-      "store_feedback_draft",
-      "mark_feedback_published"
     ]
   },
   "review": {
@@ -274,10 +261,10 @@
   "output": {
     "mode": "advice-only",
     "presentation": "numbered-natural-language",
-    "visibleLabels": [
-      "revision"
-    ],
+    "batchHeading": "{n} 번째 훈수 :",
+    "visibleLabels": [],
     "forbiddenLabels": [
+      "revision",
       "anchor",
       "category",
       "severity",
@@ -297,47 +284,17 @@
     },
     "runtimeMemory": {
       "writeVersionedArtifacts": true,
+      "writeReviewLeases": true,
       "persistAfterStop": false
     },
     "network": {
       "mode": "none"
     },
     "dataHandling": {
-      "documentInterAgentPassing": "references-only",
-      "artifactReads": "direct-mcp-access",
+      "reviewHost": "current-host",
+      "crossProcessArtifactPassing": "not-applicable-single-host",
       "snapshotsRemainLocal": true,
       "retention": "monitor-session"
-    }
-  },
-  "extensions": {
-    "hoonsoo.model-routing": {
-      "mode": "host-capability-gated",
-      "deterministicRoles": [
-        "monitoringAgent",
-        "diffCheckAgent",
-        "revisionGate",
-        "idleGuard"
-      ],
-      "hostProfiles": {
-        "codex": {
-          "fieldChecker": "gpt-5.6-luna",
-          "fieldCheckerReasoning": "low",
-          "mainReviewer": "gpt-5.6-sol",
-          "mainReviewerReasoning": "high",
-          "fallback": "current-host-model"
-        },
-        "claude-code": {
-          "fieldChecker": "haiku",
-          "fieldCheckerReasoning": "low",
-          "mainReviewer": "fable",
-          "mainReviewerReasoning": "high",
-          "fallback": "current-host-model"
-        }
-      }
-    },
-    "hoonsoo.optional-source-scout": {
-      "enabled": "on-demand-only",
-      "automaticInstallation": false
     }
   }
 }

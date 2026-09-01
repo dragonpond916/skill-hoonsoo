@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/dragonpond916/skill-hoonsoo/schemas/hoonsoo.manifest/0.3.0",
-  "title": "Hoonsoo save-triggered review manifest",
+  "$id": "https://github.com/dragonpond916/skill-hoonsoo/schemas/hoonsoo.manifest/0.4.0",
+  "title": "Hoonsoo fast saved-review manifest",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,15 +19,14 @@
     "mcpTools",
     "review",
     "output",
-    "permissions",
-    "extensions"
+    "permissions"
   ],
   "properties": {
     "$schema": {
-      "type": "string"
+      "const": "../schemas/hoonsoo.manifest.schema.json"
     },
     "schemaVersion": {
-      "const": "0.3.0"
+      "const": "0.4.0"
     },
     "kind": {
       "const": "HoonsooSkill"
@@ -47,12 +46,10 @@
           "const": "hoonsoo"
         },
         "displayName": {
-          "type": "string",
-          "minLength": 1
+          "const": "Hoonsoo"
         },
         "version": {
-          "type": "string",
-          "pattern": "^0\\.3\\.0-alpha\\.[0-9]+$"
+          "const": "0.4.0-alpha.1"
         },
         "description": {
           "$ref": "#/$defs/nonEmptyString"
@@ -160,38 +157,12 @@
               "const": false
             },
             "versionedCollections": {
-              "type": "array",
-              "uniqueItems": true,
-              "allOf": [
-                {
-                  "contains": {
-                    "const": "revisionSnapshots"
-                  }
-                },
-                {
-                  "contains": {
-                    "const": "diffArtifacts"
-                  }
-                },
-                {
-                  "contains": {
-                    "const": "fieldArtifacts"
-                  }
-                },
-                {
-                  "contains": {
-                    "const": "feedbackArtifacts"
-                  }
-                }
-              ],
-              "items": {
-                "enum": [
-                  "revisionSnapshots",
-                  "diffArtifacts",
-                  "fieldArtifacts",
-                  "feedbackArtifacts"
-                ]
-              }
+              "const": [
+                "revisionSnapshots",
+                "diffArtifacts",
+                "feedbackArtifacts",
+                "reviewLeases"
+              ]
             }
           }
         }
@@ -216,7 +187,13 @@
           "const": true
         },
         "stopConditions": {
-          "$ref": "#/$defs/nonEmptyStringArray"
+          "const": [
+            "user-cancelled",
+            "session-ended",
+            "target-deleted",
+            "runtime-failed",
+            "idle-timeout"
+          ]
         },
         "onTargetDeleted": {
           "const": "confirm-twice-then-notify-and-stop"
@@ -246,9 +223,7 @@
           "const": "metadata-polling"
         },
         "pollIntervalMs": {
-          "type": "integer",
-          "minimum": 25,
-          "maximum": 60000
+          "const": 250
         },
         "throttling": {
           "type": "object",
@@ -280,34 +255,13 @@
               "const": "stable-disk-snapshot"
             },
             "candidateMetadata": {
-              "type": "array",
-              "uniqueItems": true,
-              "allOf": [
-                {
-                  "contains": {
-                    "const": "size"
-                  }
-                },
-                {
-                  "contains": {
-                    "const": "mtimeNs"
-                  }
-                },
-                {
-                  "contains": {
-                    "const": "inode"
-                  }
-                }
-              ],
-              "items": {
-                "enum": [
-                  "device",
-                  "inode",
-                  "size",
-                  "mtimeNs",
-                  "ctimeNs"
-                ]
-              }
+              "const": [
+                "device",
+                "inode",
+                "size",
+                "mtimeNs",
+                "ctimeNs"
+              ]
             },
             "contentIdentity": {
               "const": "raw-utf8-sha256"
@@ -325,22 +279,18 @@
               "const": "stat-read-stat-with-bounded-retry"
             },
             "missingConfirmationProbes": {
-              "type": "integer",
-              "minimum": 2
+              "const": 2
             }
           }
         },
         "idleWarningMs": {
-          "type": "integer",
-          "minimum": 1
+          "const": 60000
         },
         "idleStopMs": {
-          "type": "integer",
-          "minimum": 2
+          "const": 90000
         },
         "maxFileBytes": {
-          "type": "integer",
-          "minimum": 1
+          "const": 5242880
         }
       }
     },
@@ -350,33 +300,73 @@
       "required": [
         "monitoringAgent",
         "diffCheckAgent",
-        "fieldCheckAgent",
-        "mainReviewAgent",
+        "combinedReviewAgent",
         "revisionGate",
         "idleGuard",
         "sessionOrchestrator"
       ],
       "properties": {
         "monitoringAgent": {
-          "$ref": "#/$defs/agent"
+          "allOf": [
+            {
+              "$ref": "#/$defs/deterministicAgent"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "save-monitor"
+                }
+              }
+            }
+          ]
         },
         "diffCheckAgent": {
-          "$ref": "#/$defs/agent"
+          "allOf": [
+            {
+              "$ref": "#/$defs/deterministicAgent"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "revision-diff-checker"
+                }
+              }
+            }
+          ]
         },
-        "fieldCheckAgent": {
-          "$ref": "#/$defs/agent"
-        },
-        "mainReviewAgent": {
-          "$ref": "#/$defs/agent"
+        "combinedReviewAgent": {
+          "$ref": "#/$defs/combinedReviewAgent"
         },
         "revisionGate": {
-          "$ref": "#/$defs/agent"
+          "allOf": [
+            {
+              "$ref": "#/$defs/deterministicAgent"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "revision-gate"
+                }
+              }
+            }
+          ]
         },
         "idleGuard": {
-          "$ref": "#/$defs/agent"
+          "allOf": [
+            {
+              "$ref": "#/$defs/deterministicAgent"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "idle-guard"
+                }
+              }
+            }
+          ]
         },
         "sessionOrchestrator": {
-          "$ref": "#/$defs/agent"
+          "$ref": "#/$defs/sessionOrchestrator"
         }
       }
     },
@@ -387,43 +377,109 @@
         "sequence",
         "baseline",
         "savedRevision",
+        "reviewPassesPerRevision",
+        "reviewExecution",
+        "subagentPolicy",
         "backlogPolicy",
         "staleResultPolicy",
-        "interAgentPayload",
+        "reviewLease",
         "normalWait"
       ],
       "properties": {
         "sequence": {
-          "type": "array",
-          "minItems": 6,
-          "items": {
-            "enum": [
-              "monitoringAgent",
-              "diffCheckAgent",
-              "fieldCheckAgent",
-              "mainReviewAgent",
-              "revisionGate",
-              "sessionOrchestrator"
-            ]
-          }
+          "const": [
+            "monitoringAgent",
+            "diffCheckAgent",
+            "combinedReviewAgent",
+            "revisionGate",
+            "sessionOrchestrator"
+          ]
         },
         "baseline": {
-          "$ref": "#/$defs/reviewStage"
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "internalRevision",
+            "reviewInput"
+          ],
+          "properties": {
+            "internalRevision": {
+              "const": 0
+            },
+            "reviewInput": {
+              "const": "full-revision-context"
+            }
+          }
         },
         "savedRevision": {
-          "$ref": "#/$defs/savedReviewStage"
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reviewInput"
+          ],
+          "properties": {
+            "reviewInput": {
+              "const": "aggregate-diff-context"
+            }
+          }
+        },
+        "reviewPassesPerRevision": {
+          "const": 1
+        },
+        "reviewExecution": {
+          "const": "current-host-inline"
+        },
+        "subagentPolicy": {
+          "const": "forbidden"
         },
         "backlogPolicy": {
           "const": "latest-revision-wins-with-aggregate-diff-from-last-published"
         },
         "staleResultPolicy": {
-          "const": "reject-by-revision-content-hash-and-artifact-id"
+          "const": "reject-by-review-lease-revision-content-hash-and-source"
         },
-        "interAgentPayload": {
-          "const": "artifact-references-only"
+        "reviewLease": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "defaultMs",
+            "idleClockWhileActive",
+            "idleClockResumeOn"
+          ],
+          "properties": {
+            "defaultMs": {
+              "const": 180000
+            },
+            "idleClockWhileActive": {
+              "const": "paused"
+            },
+            "idleClockResumeOn": {
+              "const": [
+                "feedback-published",
+                "lease-expired"
+              ]
+            }
+          }
         },
         "normalWait": {
-          "const": "event-driven-without-timeout"
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "timeoutMs",
+            "hostToolDefaultMs",
+            "onTimeout"
+          ],
+          "properties": {
+            "timeoutMs": {
+              "const": 45000
+            },
+            "hostToolDefaultMs": {
+              "const": 60000
+            },
+            "onTimeout": {
+              "const": "silent-retry"
+            }
+          }
         }
       }
     },
@@ -431,19 +487,18 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "monitoring",
-        "artifactReads",
-        "sessionWrites"
+        "public"
       ],
       "properties": {
-        "monitoring": {
-          "$ref": "#/$defs/nonEmptyStringArray"
-        },
-        "artifactReads": {
-          "$ref": "#/$defs/nonEmptyStringArray"
-        },
-        "sessionWrites": {
-          "$ref": "#/$defs/nonEmptyStringArray"
+        "public": {
+          "const": [
+            "start_monitor",
+            "read_review_context",
+            "publish_feedback",
+            "wait_for_save",
+            "get_status",
+            "stop_monitor"
+          ]
         }
       }
     },
@@ -464,10 +519,25 @@
           "const": "merge-as-additional-priorities"
         },
         "contentChecks": {
-          "$ref": "#/$defs/nonEmptyStringArray"
+          "const": [
+            "completeness",
+            "consistency",
+            "clarity",
+            "risk",
+            "missing-assumptions",
+            "actionability"
+          ]
         },
         "grammarChecks": {
-          "$ref": "#/$defs/nonEmptyStringArray"
+          "const": [
+            "file-syntax",
+            "natural-language-grammar",
+            "spelling",
+            "punctuation",
+            "style",
+            "terminology-consistency",
+            "whitespace-and-formatting"
+          ]
         }
       }
     },
@@ -477,6 +547,7 @@
       "required": [
         "mode",
         "presentation",
+        "batchHeading",
         "visibleLabels",
         "forbiddenLabels",
         "targetMutation"
@@ -488,17 +559,23 @@
         "presentation": {
           "const": "numbered-natural-language"
         },
+        "batchHeading": {
+          "const": "{n} 번째 훈수 :"
+        },
         "visibleLabels": {
-          "type": "array",
-          "contains": {
-            "const": "revision"
-          },
-          "items": {
-            "type": "string"
-          }
+          "const": []
         },
         "forbiddenLabels": {
-          "$ref": "#/$defs/nonEmptyStringArray"
+          "const": [
+            "revision",
+            "anchor",
+            "category",
+            "severity",
+            "message",
+            "rationale",
+            "suggestedAction",
+            "confidence"
+          ]
         },
         "targetMutation": {
           "const": "forbidden"
@@ -544,10 +621,14 @@
           "additionalProperties": false,
           "required": [
             "writeVersionedArtifacts",
+            "writeReviewLeases",
             "persistAfterStop"
           ],
           "properties": {
             "writeVersionedArtifacts": {
+              "const": true
+            },
+            "writeReviewLeases": {
               "const": true
             },
             "persistAfterStop": {
@@ -571,52 +652,23 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "documentInterAgentPassing",
-            "artifactReads",
+            "reviewHost",
+            "crossProcessArtifactPassing",
             "snapshotsRemainLocal",
             "retention"
           ],
           "properties": {
-            "documentInterAgentPassing": {
-              "const": "references-only"
+            "reviewHost": {
+              "const": "current-host"
             },
-            "artifactReads": {
-              "const": "direct-mcp-access"
+            "crossProcessArtifactPassing": {
+              "const": "not-applicable-single-host"
             },
             "snapshotsRemainLocal": {
               "const": true
             },
             "retention": {
               "const": "monitor-session"
-            }
-          }
-        }
-      }
-    },
-    "extensions": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "hoonsoo.model-routing",
-        "hoonsoo.optional-source-scout"
-      ],
-      "properties": {
-        "hoonsoo.model-routing": {
-          "$ref": "#/$defs/modelRouting"
-        },
-        "hoonsoo.optional-source-scout": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "enabled",
-            "automaticInstallation"
-          ],
-          "properties": {
-            "enabled": {
-              "const": "on-demand-only"
-            },
-            "automaticInstallation": {
-              "const": false
             }
           }
         }
@@ -703,7 +755,7 @@
         }
       }
     },
-    "agent": {
+    "deterministicAgent": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -717,22 +769,18 @@
       ],
       "properties": {
         "role": {
-          "$ref": "#/$defs/nonEmptyString"
+          "enum": [
+            "save-monitor",
+            "revision-diff-checker",
+            "revision-gate",
+            "idle-guard"
+          ]
         },
         "implementation": {
-          "enum": [
-            "deterministic-worker",
-            "llm-agent",
-            "host-agent"
-          ]
+          "const": "deterministic-worker"
         },
         "modelClass": {
-          "enum": [
-            "none",
-            "efficient",
-            "flagship",
-            "current-host"
-          ]
+          "const": "none"
         },
         "responsibility": {
           "$ref": "#/$defs/nonEmptyString"
@@ -748,112 +796,75 @@
         }
       }
     },
-    "reviewStage": {
+    "combinedReviewAgent": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "revision",
-        "fieldInput",
-        "review"
+        "role",
+        "implementation",
+        "modelClass",
+        "responsibility",
+        "inputs",
+        "outputs",
+        "effectPolicy"
       ],
       "properties": {
-        "revision": {
-          "const": 0
+        "role": {
+          "const": "combined-reviewer"
         },
-        "fieldInput": {
-          "const": "full-revision-artifact"
+        "implementation": {
+          "const": "current-host"
         },
-        "review": {
-          "const": "combined-content-and-grammar"
-        }
-      }
-    },
-    "savedReviewStage": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "fieldInput",
-        "reviewInput",
-        "review"
-      ],
-      "properties": {
-        "fieldInput": {
-          "const": "diff-artifact"
+        "modelClass": {
+          "const": "current-host"
         },
-        "reviewInput": {
-          "const": "review-bundle"
+        "responsibility": {
+          "$ref": "#/$defs/nonEmptyString"
         },
-        "review": {
-          "const": "combined-content-and-grammar"
-        }
-      }
-    },
-    "modelRouting": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "mode",
-        "deterministicRoles",
-        "hostProfiles"
-      ],
-      "properties": {
-        "mode": {
-          "const": "host-capability-gated"
-        },
-        "deterministicRoles": {
+        "inputs": {
           "$ref": "#/$defs/nonEmptyStringArray"
         },
-        "hostProfiles": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "codex",
-            "claude-code"
-          ],
-          "properties": {
-            "codex": {
-              "$ref": "#/$defs/hostProfile"
-            },
-            "claude-code": {
-              "$ref": "#/$defs/hostProfile"
-            }
-          }
+        "outputs": {
+          "$ref": "#/$defs/nonEmptyStringArray"
+        },
+        "effectPolicy": {
+          "const": "advice-only-no-file-mutation"
         }
       }
     },
-    "hostProfile": {
+    "sessionOrchestrator": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "fieldChecker",
-        "fieldCheckerReasoning",
-        "mainReviewer",
-        "mainReviewerReasoning",
-        "fallback"
+        "role",
+        "implementation",
+        "modelClass",
+        "responsibility",
+        "inputs",
+        "outputs",
+        "effectPolicy"
       ],
       "properties": {
-        "fieldChecker": {
+        "role": {
+          "const": "host-session-orchestrator"
+        },
+        "implementation": {
+          "const": "host-agent"
+        },
+        "modelClass": {
+          "const": "current-host"
+        },
+        "responsibility": {
           "$ref": "#/$defs/nonEmptyString"
         },
-        "fieldCheckerReasoning": {
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
+        "inputs": {
+          "$ref": "#/$defs/nonEmptyStringArray"
         },
-        "mainReviewer": {
-          "$ref": "#/$defs/nonEmptyString"
+        "outputs": {
+          "$ref": "#/$defs/nonEmptyStringArray"
         },
-        "mainReviewerReasoning": {
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
-        },
-        "fallback": {
-          "const": "current-host-model"
+        "effectPolicy": {
+          "const": "presentation-and-session-control-only"
         }
       }
     }

@@ -1,7 +1,7 @@
 {
   "name": "skill-hoonsoo",
-  "version": "0.3.0",
-  "description": "Read-only combined content and grammar review for saved local document revisions.",
+  "version": "0.4.0",
+  "description": "Fast read-only combined content and grammar review for saved local document revisions.",
   "author": {
     "name": "dragonpond"
   },
@@ -19,16 +19,16 @@
   },
   "interface": {
     "displayName": "Hoonsoo",
-    "shortDescription": "Read-only advice whenever a document is saved.",
-    "longDescription": "Observes user-selected documents only after changes reach disk, then reviews content, structure, and grammar without modifying source files.",
+    "shortDescription": "Fast read-only advice whenever a document is saved.",
+    "longDescription": "Observes saved local document states and reviews content, structure, and grammar in one current-host pass without modifying files.",
     "developerName": "dragonpond",
     "category": "Productivity",
     "capabilities": [
       "Read"
     ],
     "defaultPrompt": [
-      "Use $hoonsoo with a local file path to review its content, structure, and grammar whenever it is saved.",
-      "Use $hoonsoo with a local file path and my additional review priorities, then wait for saved revisions."
+      "Use $hoonsoo with a local file path to review its content, structure, and grammar in one fast pass whenever it is saved.",
+      "Use $hoonsoo with a local file path and my additional review priorities, without subagents or file edits."
     ]
   }
 }
