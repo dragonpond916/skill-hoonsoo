@@ -2,52 +2,15 @@
 
 `skill-sherpa`는 로컬 문서의 **디스크 저장 상태**를 관찰하고, 내용·구조와 문법·맞춤법을 한 번에 검토하는 **Codex·Claude Code 겸용 읽기 전용 플러그인**입니다. 대상 파일을 수정하지 않으며 모든 제안은 적용되지 않은 조언으로만 전달합니다.
 
-## 0.5.0 이름 변경
+## 공개 인터페이스
 
-제품 이름과 공개 식별자를 `Hoonsoo`에서 `Sherpa`로 변경했습니다. 복잡한 산행을 안내하는 셰르파처럼, 사용자가 문서를 완성하는 동안 옆에서 방향과 위험을 알려주는 역할을 표현합니다.
+복잡한 산행을 안내하는 셰르파처럼, 사용자가 문서를 완성하는 동안 옆에서 방향과 위험을 알려주는 역할을 표현합니다.
 
 - 플러그인: `skill-sherpa`
 - Codex: `$sherpa <filepath> <prompt>`
 - Claude Code: `/skill-sherpa:sherpa <filepath> <prompt>`
 - MCP server: `sherpa`
 - 출력: `세르파의 {n}번째 조언 :`
-
-소스 이력과 기존 링크를 보존하기 위해 GitHub 저장소 주소는 당분간 `dragonpond916/skill-hoonsoo`를 유지합니다. 저장소 이름과 설치되는 플러그인 이름은 서로 독립적입니다.
-
-### 0.4.x에서 이전
-
-이 변경은 플러그인 ID가 바뀌는 breaking rename입니다. 기존 플러그인을 둔 채 새 플러그인을 설치하면 두 스킬과 MCP가 함께 노출될 수 있으므로 먼저 기존 설치를 제거합니다.
-
-```bash
-codex plugin remove skill-hoonsoo@skill-hoonsoo
-codex plugin marketplace remove skill-hoonsoo
-codex plugin marketplace add dragonpond916/skill-hoonsoo --ref main
-codex plugin add skill-sherpa@skill-sherpa
-```
-
-Claude Code에서는 기존 플러그인과 marketplace를 제거한 뒤 같은 저장소를 다시 등록합니다.
-
-```text
-/plugin uninstall skill-hoonsoo@skill-hoonsoo
-/plugin marketplace remove skill-hoonsoo
-/plugin marketplace add dragonpond916/skill-hoonsoo
-/plugin install skill-sherpa@skill-sherpa
-/reload-plugins
-```
-
-## 0.4.0 성능 개선
-
-0.3.0은 별도 FieldChecker와 Main Reviewer가 MCP의 메모리 artifact를 차례로 읽는 구조였습니다. 그러나 stdio MCP의 session memory는 프로세스 로컬이므로, 다른 agent 세션이 같은 `monitorId`를 읽으면 `MONITOR_NOT_FOUND`가 날 수 있었습니다. 두 agent의 직렬 실행과 반복적인 artifact 조회도 저장 후 응답을 크게 늦췄고, 그 사이 90초 idle 종료가 먼저 발생할 수 있었습니다.
-
-0.4.0은 다음과 같이 단순화했습니다.
-
-- Sherpa 검토에는 subagent를 만들지 않고 현재 host model이 직접 응답합니다.
-- 문서 분야 판단, 내용 검토, 문법 검토를 revision당 한 번의 LLM pass로 합쳤습니다.
-- `read_review_context` 한 번으로 prompt, bounded 문서 context, 변경 diff, 이전 조언을 함께 읽습니다.
-- 입력 토큰을 극단적으로 줄이는 대신 필요한 context를 한 번에 제공해 왕복 호출과 대기 시간을 줄였습니다.
-- 파일 관찰 기본 주기를 2초에서 250ms로 줄였습니다.
-- 분석 lease가 활성화된 동안 60/90초 idle 시계를 멈추고, 응답 공개 후부터 다시 계산합니다.
-- 사용자 출력에서 내부 `revision:` 라벨을 제거했습니다.
 
 ## 제공 기능
 
@@ -81,10 +44,10 @@ Claude Code에서는 기존 플러그인과 marketplace를 제거한 뒤 같은 
 
 ### Codex
 
-GitHub 저장소는 `owner/repo` 형식으로 등록할 수 있습니다.
+GitHub 저장소는 `owner/repository` 형식으로 등록할 수 있습니다.
 
 ```bash
-codex plugin marketplace add dragonpond916/skill-hoonsoo --ref main
+codex plugin marketplace add dragonpond916/skill-sherpa --ref main
 codex plugin add skill-sherpa@skill-sherpa
 ```
 
@@ -98,7 +61,7 @@ codex plugin add skill-sherpa@skill-sherpa
 ### Claude Code
 
 ```bash
-claude plugin marketplace add dragonpond916/skill-hoonsoo
+claude plugin marketplace add dragonpond916/skill-sherpa
 claude plugin install skill-sherpa@skill-sherpa
 ```
 
@@ -165,7 +128,7 @@ Claude Code에서는 재시작하거나 `/reload-plugins`를 실행한 뒤 호�
 6. 내용 변경 없이 다시 저장했을 때 LLM 검토가 생기지 않는지 확인합니다.
 7. LLM 응답이 90초를 넘겨도 분석 중 idle 종료가 발생하지 않는지 확인합니다.
 8. 응답 공개 후 아무 변경 없이 1분이 지나면 안내가 한 번 나오고, 추가 30초 후 종료되는지 확인합니다.
-9. `세르파 중지` 또는 `stop Sherpa`로 즉시 종료되는지 확인합니다. 0.5 전환 기간에는 기존 `훈수중지`도 취소 표현으로 인식합니다.
+9. `세르파 중지` 또는 `stop Sherpa`로 즉시 종료되는지 확인합니다.
 
 ## 동작 구조
 
@@ -195,7 +158,7 @@ runtime이 공개하는 MCP 도구는 정확히 다음 여섯 개입니다.
 - `get_status`
 - `stop_monitor`
 
-`wait_for_save`는 일반적인 60초 MCP tool timeout보다 짧은 45초 단위로 기다립니다. timeout 자체는 사용자에게 표시하지 않고 즉시 다시 기다립니다. 이전 버전보다 작은 도구 호출이 조금 늘 수 있지만, host timeout으로 감시가 끊기는 위험을 줄입니다.
+`wait_for_save`는 일반적인 60초 MCP tool timeout보다 짧은 45초 단위로 기다립니다. timeout 자체는 사용자에게 표시하지 않고 즉시 다시 기다립니다. 작은 도구 호출이 조금 늘 수 있지만, host timeout으로 감시가 끊기는 위험을 줄입니다.
 
 ### 선택적으로 유용한 MCP·플러그인
 
@@ -237,4 +200,4 @@ skill-sherpa/
 └── schemas/
 ```
 
-`schemas/sherpa.manifest.schema.json`과 `examples/sherpa.manifest.json`은 0.5.0 fast-path 설계 reference입니다. 실제 설치 기준은 `plugins/skill-sherpa/`입니다.
+`schemas/sherpa.manifest.schema.json`과 `examples/sherpa.manifest.json`은 현재 동작 구조의 설계 reference입니다. 실제 설치 기준은 `plugins/skill-sherpa/`입니다.

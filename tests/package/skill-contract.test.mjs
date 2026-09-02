@@ -71,7 +71,7 @@ test("retired subagent definitions are not packaged", async () => {
   await assert.rejects(read("agents/sherpa-advisor.md"), { code: "ENOENT" });
 });
 
-test("documentation and design reference describe the 0.5.0 Sherpa fast path", async () => {
+test("documentation describes Sherpa as the sole product identity", async () => {
   const readme = await read("README.md");
   const packageMetadata = JSON.parse(await read("package.json"));
   const manifest = JSON.parse(await read("examples/sherpa.manifest.json"));
@@ -100,17 +100,17 @@ test("documentation and design reference describe the 0.5.0 Sherpa fast path", a
     : Object.values(manifest.mcpTools).flat();
   assert.deepEqual([...configuredTools].sort(), [...publicTools].sort());
 
-  assert.match(readme, /0\.4\.0 성능 개선/);
-  assert.match(readme, /0\.5\.0 이름 변경/);
-  assert.match(readme, /제품 이름과 공개 식별자를 `Hoonsoo`에서 `Sherpa`로 변경/);
-  assert.match(readme, /dragonpond916\/skill-hoonsoo.*유지/s);
-  assert.match(readme, /MONITOR_NOT_FOUND/);
-  assert.match(readme, /현재 host model이 직접 응답/);
-  assert.match(readme, /한 번의 LLM pass/);
-  assert.match(readme, /2초에서 250ms/);
-  assert.match(readme, /분석 lease.*idle/is);
-  assert.match(readme, /내부 `revision:` 라벨을 제거/);
+  assert.match(readme, /^# skill-sherpa$/m);
+  assert.match(readme, /\$sherpa <filepath> <prompt>/);
+  assert.match(readme, /\/skill-sherpa:sherpa <filepath> <prompt>/);
+  assert.match(readme, /세르파의 \{n\}번째 조언 :/);
+  assert.match(readme, /dragonpond916\/skill-sherpa/);
+  assert.match(readme, /현재 동작 구조의 설계 reference/);
   assert.match(readme, /수동 Save와 autosave를 구분하지 못합니다/);
+  assert.doesNotMatch(
+    readme,
+    /hoonsoo|훈수중지|이름 변경|성능 개선|breaking rename|0\.3\.0|0\.4\.0|0\.5\.0/iu,
+  );
   assert.doesNotMatch(readme, /gpt-5\.6-luna|gpt-5\.6-sol|sherpa-field-checker|sherpa-advisor/);
 });
 
