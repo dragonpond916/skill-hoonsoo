@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectDirectory = path.resolve(currentDirectory, "../..");
-const serverScript = path.join(projectDirectory, "scripts", "hoonsoo-mcp.mjs");
+const serverScript = path.join(projectDirectory, "scripts", "sherpa-mcp.mjs");
 const temporaryDirectories = [];
 const clients = [];
 
@@ -115,7 +115,7 @@ class JsonRpcClient {
 }
 
 async function temporaryDirectory() {
-  const directory = await mkdtemp(path.join(tmpdir(), "hoonsoo-mcp-test-"));
+  const directory = await mkdtemp(path.join(tmpdir(), "sherpa-mcp-test-"));
   temporaryDirectories.push(directory);
   return directory;
 }
@@ -129,7 +129,7 @@ afterEach(async () => {
   );
 });
 
-test("serves the 0.4.0 six-tool inline review lifecycle over JSONL stdio", async () => {
+test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "large-document.md");
   await writeFile(target, "x".repeat(100_000), "utf8");
@@ -139,11 +139,11 @@ test("serves the 0.4.0 six-tool inline review lifecycle over JSONL stdio", async
   const initialize = await client.request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
-    clientInfo: { name: "hoonsoo-test", version: "1.0.0" },
+    clientInfo: { name: "sherpa-test", version: "1.0.0" },
   });
   assert.equal(initialize.result.protocolVersion, "2024-11-05");
-  assert.equal(initialize.result.serverInfo.name, "hoonsoo");
-  assert.equal(initialize.result.serverInfo.version, "0.4.0");
+  assert.equal(initialize.result.serverInfo.name, "sherpa");
+  assert.equal(initialize.result.serverInfo.version, "0.5.0");
   assert.deepEqual(initialize.result.capabilities, { tools: { listChanged: false } });
   assert.match(initialize.result.instructions.slice(0, 512), /six tools/i);
   assert.match(initialize.result.instructions.slice(0, 512), /current host/i);
@@ -318,7 +318,7 @@ test("returns tool errors without terminating the MCP server", async () => {
   await client.request("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
-    clientInfo: { name: "hoonsoo-test", version: "1.0.0" },
+    clientInfo: { name: "sherpa-test", version: "1.0.0" },
   });
   client.notify("notifications/initialized");
 
@@ -342,7 +342,7 @@ test("honors JSON-RPC cancellation for a long wait", async () => {
   await client.request("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
-    clientInfo: { name: "hoonsoo-test", version: "1.0.0" },
+    clientInfo: { name: "sherpa-test", version: "1.0.0" },
   });
   client.notify("notifications/initialized");
   const startCall = await client.request("tools/call", {

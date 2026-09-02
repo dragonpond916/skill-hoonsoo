@@ -4,15 +4,15 @@ import { fileURLToPath } from "node:url";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectDirectory = path.resolve(currentDirectory, "..");
-const packageDirectory = path.join(projectDirectory, "plugins", "skill-hoonsoo");
+const packageDirectory = path.join(projectDirectory, "plugins", "skill-sherpa");
 
 const packagedFiles = [
   ".claude-plugin/plugin.json",
   ".codex-plugin/plugin.json",
   "claude.mcp.json",
-  "scripts/hoonsoo-mcp.mjs",
-  "skills/hoonsoo/SKILL.md",
-  "skills/hoonsoo/agents/openai.yaml",
+  "scripts/sherpa-mcp.mjs",
+  "skills/sherpa/SKILL.md",
+  "skills/sherpa/agents/openai.yaml",
 ].sort();
 
 async function assertRegularFile(filePath, label) {

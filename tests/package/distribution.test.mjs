@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectDirectory = path.resolve(currentDirectory, "../..");
-const packageDirectory = path.join(projectDirectory, "plugins", "skill-hoonsoo");
+const packageDirectory = path.join(projectDirectory, "plugins", "skill-sherpa");
 
 async function readJson(...segments) {
   return JSON.parse(await readFile(path.join(...segments), "utf8"));
@@ -60,8 +60,8 @@ async function smokeTestMcp(server, host) {
       capabilities: {},
       clientInfo: { name: `${host}-package-test`, version: "1.0.0" },
     });
-    assert.equal(response.result.serverInfo.name, "hoonsoo", stderr);
-    assert.equal(response.result.serverInfo.version, "0.4.0", stderr);
+    assert.equal(response.result.serverInfo.name, "sherpa", stderr);
+    assert.equal(response.result.serverInfo.version, "0.5.0", stderr);
   } finally {
     child.stdin.end();
     child.kill("SIGTERM");
@@ -72,42 +72,56 @@ test("marketplaces point at the deterministic distribution package", async () =>
   const codexMarketplace = await readJson(projectDirectory, ".agents", "plugins", "marketplace.json");
   const claudeMarketplace = await readJson(projectDirectory, ".claude-plugin", "marketplace.json");
 
-  assert.equal(codexMarketplace.name, "skill-hoonsoo");
-  assert.equal(codexMarketplace.plugins[0].name, "skill-hoonsoo");
+  assert.equal(codexMarketplace.name, "skill-sherpa");
+  assert.equal(codexMarketplace.plugins[0].name, "skill-sherpa");
   assert.deepEqual(codexMarketplace.plugins[0].source, {
     source: "local",
-    path: "./plugins/skill-hoonsoo",
+    path: "./plugins/skill-sherpa",
   });
-  assert.equal(claudeMarketplace.name, "skill-hoonsoo");
-  assert.equal(claudeMarketplace.plugins[0].name, "skill-hoonsoo");
-  assert.equal(claudeMarketplace.plugins[0].source, "./plugins/skill-hoonsoo");
+  assert.equal(claudeMarketplace.name, "skill-sherpa");
+  assert.equal(claudeMarketplace.plugins[0].name, "skill-sherpa");
+  assert.equal(claudeMarketplace.plugins[0].source, "./plugins/skill-sherpa");
 });
 
 test("package contains only the install-time files", async () => {
-  assert.deepEqual(await listFiles(packageDirectory), [
+  const packagedFiles = await listFiles(packageDirectory);
+  assert.deepEqual(packagedFiles, [
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
     "claude.mcp.json",
-    "scripts/hoonsoo-mcp.mjs",
-    "skills/hoonsoo/SKILL.md",
-    "skills/hoonsoo/agents/openai.yaml",
+    "scripts/sherpa-mcp.mjs",
+    "skills/sherpa/SKILL.md",
+    "skills/sherpa/agents/openai.yaml",
   ]);
 
   const codexManifest = await readJson(packageDirectory, ".codex-plugin", "plugin.json");
   const claudeManifest = await readJson(packageDirectory, ".claude-plugin", "plugin.json");
-  assert.equal(codexManifest.name, "skill-hoonsoo");
+  assert.equal(codexManifest.name, "skill-sherpa");
   assert.equal(claudeManifest.name, codexManifest.name);
-  assert.equal(codexManifest.version, "0.4.0");
+  assert.equal(codexManifest.version, "0.5.0");
   assert.equal(claudeManifest.version, codexManifest.version);
-  assert.equal(codexManifest.mcpServers.hoonsoo.cwd, ".");
+  assert.equal(codexManifest.mcpServers.sherpa.cwd, ".");
   assert.equal(claudeManifest.mcpServers, "./claude.mcp.json");
+
+  for (const relativePath of packagedFiles) {
+    const content = await readFile(path.join(packageDirectory, relativePath), "utf8");
+    const withoutLegacyRepositoryUrl = content.replaceAll(
+      "https://github.com/dragonpond916/skill-hoonsoo",
+      "",
+    );
+    assert.doesNotMatch(
+      withoutLegacyRepositoryUrl,
+      /\bHoonsoo\b|\$hoonsoo|skill-hoonsoo|skills\/hoonsoo|scripts\/hoonsoo/,
+      `legacy identity remains in ${relativePath}`,
+    );
+  }
 });
 
 test("Codex and Claude MCP configs start the packaged runtime", async () => {
   const codexManifest = await readJson(packageDirectory, ".codex-plugin", "plugin.json");
   const claudeConfig = await readJson(packageDirectory, "claude.mcp.json");
-  assert.equal(codexManifest.mcpServers.hoonsoo.cwd, ".");
-  assert.equal(claudeConfig.mcpServers.hoonsoo.cwd, undefined);
-  await smokeTestMcp(codexManifest.mcpServers.hoonsoo, "codex");
-  await smokeTestMcp(claudeConfig.mcpServers.hoonsoo, "claude");
+  assert.equal(codexManifest.mcpServers.sherpa.cwd, ".");
+  assert.equal(claudeConfig.mcpServers.sherpa.cwd, undefined);
+  await smokeTestMcp(codexManifest.mcpServers.sherpa, "codex");
+  await smokeTestMcp(claudeConfig.mcpServers.sherpa, "claude");
 });

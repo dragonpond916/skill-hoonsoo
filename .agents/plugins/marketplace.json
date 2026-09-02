@@ -1,14 +1,14 @@
 {
-  "name": "skill-hoonsoo",
+  "name": "skill-sherpa",
   "interface": {
-    "displayName": "Hoonsoo"
+    "displayName": "Sherpa"
   },
   "plugins": [
     {
-      "name": "skill-hoonsoo",
+      "name": "skill-sherpa",
       "source": {
         "source": "local",
-        "path": "./plugins/skill-hoonsoo"
+        "path": "./plugins/skill-sherpa"
       },
       "policy": {
         "installation": "AVAILABLE",

@@ -1,8 +1,8 @@
 {
-  "name": "skill-hoonsoo",
-  "displayName": "Hoonsoo",
-  "version": "0.4.0",
-  "description": "Fast read-only combined content and grammar review for saved local document revisions.",
+  "name": "skill-sherpa",
+  "displayName": "Sherpa",
+  "version": "0.5.0",
+  "description": "Sherpa gives fast read-only content and grammar guidance for saved local document revisions.",
   "author": {
     "name": "dragonpond",
     "url": "https://github.com/dragonpond916"
@@ -15,7 +15,8 @@
     "grammar",
     "document",
     "save-aware",
-    "mcp"
+    "mcp",
+    "sherpa"
   ],
   "skills": "./skills/",
   "mcpServers": "./claude.mcp.json"

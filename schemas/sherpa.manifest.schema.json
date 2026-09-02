@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/dragonpond916/skill-hoonsoo/schemas/hoonsoo.manifest/0.4.0",
-  "title": "Hoonsoo fast saved-review manifest",
+  "$id": "https://github.com/dragonpond916/skill-hoonsoo/schemas/sherpa.manifest/0.5.0",
+  "title": "Sherpa fast saved-review manifest",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -23,13 +23,13 @@
   ],
   "properties": {
     "$schema": {
-      "const": "../schemas/hoonsoo.manifest.schema.json"
+      "const": "../schemas/sherpa.manifest.schema.json"
     },
     "schemaVersion": {
-      "const": "0.4.0"
+      "const": "0.5.0"
     },
     "kind": {
-      "const": "HoonsooSkill"
+      "const": "SherpaSkill"
     },
     "metadata": {
       "type": "object",
@@ -43,13 +43,13 @@
       ],
       "properties": {
         "name": {
-          "const": "hoonsoo"
+          "const": "sherpa"
         },
         "displayName": {
-          "const": "Hoonsoo"
+          "const": "Sherpa"
         },
         "version": {
-          "const": "0.4.0-alpha.1"
+          "const": "0.5.0"
         },
         "description": {
           "$ref": "#/$defs/nonEmptyString"
@@ -72,7 +72,7 @@
           "const": "agentskills.io"
         },
         "path": {
-          "const": "./skills/hoonsoo/SKILL.md"
+          "const": "./skills/sherpa/SKILL.md"
         },
         "implicitInvocation": {
           "type": "boolean"
@@ -91,10 +91,10 @@
       ],
       "properties": {
         "codexInvocation": {
-          "const": "$hoonsoo <filePath> <prompt>"
+          "const": "$sherpa <filePath> <prompt>"
         },
         "claudeInvocation": {
-          "const": "/skill-hoonsoo:hoonsoo <filePath> <prompt>"
+          "const": "/skill-sherpa:sherpa <filePath> <prompt>"
         },
         "action": {
           "const": "start-or-reconfigure-monitor"
@@ -560,7 +560,7 @@
           "const": "numbered-natural-language"
         },
         "batchHeading": {
-          "const": "{n} 번째 훈수 :"
+          "const": "세르파의 {n}번째 조언 :"
         },
         "visibleLabels": {
           "const": []

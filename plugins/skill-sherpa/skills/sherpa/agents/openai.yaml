@@ -1,12 +1,12 @@
 interface:
-  display_name: "Hoonsoo"
+  display_name: "Sherpa"
   short_description: "Fast save-triggered content and grammar review"
-  default_prompt: "Use $hoonsoo <filepath> <prompt> to monitor disk-backed saves. Review content and grammar together in one current-host pass, without subagents or file edits."
+  default_prompt: "Use $sherpa <filepath> <prompt> to monitor disk-backed saves. Review content and grammar together in one current-host pass, without subagents or file edits."
 
 dependencies:
   tools:
     - type: "mcp"
-      value: "hoonsoo"
+      value: "sherpa"
       description: "Read-only document monitor with one-call review context and atomic feedback publication"
       transport: "stdio"
 

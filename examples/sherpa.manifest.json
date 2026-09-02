@@ -1,11 +1,11 @@
 {
-  "$schema": "../schemas/hoonsoo.manifest.schema.json",
-  "schemaVersion": "0.4.0",
-  "kind": "HoonsooSkill",
+  "$schema": "../schemas/sherpa.manifest.schema.json",
+  "schemaVersion": "0.5.0",
+  "kind": "SherpaSkill",
   "metadata": {
-    "name": "hoonsoo",
-    "displayName": "Hoonsoo",
-    "version": "0.4.0-alpha.1",
+    "name": "sherpa",
+    "displayName": "Sherpa",
+    "version": "0.5.0",
     "description": "Review document content and grammar in one current-host pass after stable saved states without modifying the source file.",
     "keywords": [
       "advice-only",
@@ -16,12 +16,12 @@
   },
   "skill": {
     "standard": "agentskills.io",
-    "path": "./skills/hoonsoo/SKILL.md",
+    "path": "./skills/sherpa/SKILL.md",
     "implicitInvocation": true
   },
   "command": {
-    "codexInvocation": "$hoonsoo <filePath> <prompt>",
-    "claudeInvocation": "/skill-hoonsoo:hoonsoo <filePath> <prompt>",
+    "codexInvocation": "$sherpa <filePath> <prompt>",
+    "claudeInvocation": "/skill-sherpa:sherpa <filePath> <prompt>",
     "action": "start-or-reconfigure-monitor",
     "reviewScope": "content-and-grammar",
     "arguments": [
@@ -261,7 +261,7 @@
   "output": {
     "mode": "advice-only",
     "presentation": "numbered-natural-language",
-    "batchHeading": "{n} 번째 훈수 :",
+    "batchHeading": "세르파의 {n}번째 조언 :",
     "visibleLabels": [],
     "forbiddenLabels": [
       "revision",

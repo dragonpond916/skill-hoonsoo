@@ -1,14 +1,14 @@
 {
-  "name": "skill-hoonsoo",
+  "name": "skill-sherpa",
   "owner": {
     "name": "dragonpond",
     "url": "https://github.com/dragonpond916"
   },
   "plugins": [
     {
-      "name": "skill-hoonsoo",
-      "source": "./plugins/skill-hoonsoo",
-      "description": "Fast single-pass read-only content and grammar review for saved document revisions"
+      "name": "skill-sherpa",
+      "source": "./plugins/skill-sherpa",
+      "description": "Sherpa provides fast single-pass, read-only guidance for saved document revisions"
     }
   ]
 }

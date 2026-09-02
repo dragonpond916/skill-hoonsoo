@@ -14,13 +14,13 @@ import {
   computeContentHash,
   computeLineDelta,
   normalizeTargetPath,
-} from "../../scripts/hoonsoo-mcp.mjs";
+} from "../../scripts/sherpa-mcp.mjs";
 
 const temporaryDirectories = [];
 const sessions = [];
 
 async function temporaryDirectory() {
-  const directory = await mkdtemp(path.join(tmpdir(), "hoonsoo-runtime-test-"));
+  const directory = await mkdtemp(path.join(tmpdir(), "sherpa-runtime-test-"));
   temporaryDirectories.push(directory);
   return directory;
 }

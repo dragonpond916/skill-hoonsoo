@@ -17,8 +17,8 @@ export const DEFAULT_IDLE_WARNING_MS = 60_000;
 export const DEFAULT_IDLE_STOP_MS = 90_000;
 export const DEFAULT_REVIEW_LEASE_MS = 180_000;
 export const IDLE_WARNING_MESSAGE =
-  "1분 간, 작업이 감지되지 않습니다. 추가 30초 대기 후, 훈수모드가 정지됩니다.\n" +
-  "추후 다시 훈수모드를 켜시려면 스킬을 다시 실행해주세요.";
+  "1분간 작업이 감지되지 않았습니다. 30초 더 기다린 후 세르파 모드가 정지됩니다.\n" +
+  "나중에 다시 시작하려면 $sherpa를 호출해주세요.";
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const READ_RETRY_DELAY_MS = 25;
@@ -39,8 +39,8 @@ const MAX_FEEDBACK_CHARACTERS = 24_000;
 const MAX_REVIEW_HISTORY_ITEMS = 10;
 const MAX_REVIEW_HISTORY_CHARACTERS = 24_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
-const SERVER_NAME = "hoonsoo";
-const SERVER_VERSION = "0.4.0";
+const SERVER_NAME = "sherpa";
+const SERVER_VERSION = "0.5.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const TOOL_DEFINITIONS = [
@@ -64,7 +64,7 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Start Hoonsoo monitor",
+      title: "Start Sherpa monitor",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -89,7 +89,7 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Read Hoonsoo inline review context",
+      title: "Read Sherpa inline review context",
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
@@ -113,7 +113,7 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Publish Hoonsoo inline feedback",
+      title: "Publish Sherpa inline feedback",
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
@@ -140,7 +140,7 @@ const TOOL_DEFINITIONS = [
       },
     },
     annotations: {
-      title: "Wait for Hoonsoo save",
+      title: "Wait for Sherpa save",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -156,7 +156,7 @@ const TOOL_DEFINITIONS = [
       properties: { monitorId: { type: "string" } },
     },
     annotations: {
-      title: "Get Hoonsoo status",
+      title: "Get Sherpa status",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -173,7 +173,7 @@ const TOOL_DEFINITIONS = [
       properties: { monitorId: { type: "string" } },
     },
     annotations: {
-      title: "Stop Hoonsoo monitor",
+      title: "Stop Sherpa monitor",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -182,10 +182,10 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
-export class HoonsooError extends Error {
+export class SherpaError extends Error {
   constructor(code, message, details = undefined) {
     super(message);
-    this.name = "HoonsooError";
+    this.name = "SherpaError";
     this.code = code;
     this.details = details;
   }
@@ -198,7 +198,7 @@ function sleep(milliseconds) {
 function assertObject(value, label = "arguments") {
   if (value === undefined) return {};
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new HoonsooError("INVALID_ARGUMENT", `${label} must be an object.`);
+    throw new SherpaError("INVALID_ARGUMENT", `${label} must be an object.`);
   }
   return value;
 }
@@ -206,7 +206,7 @@ function assertObject(value, label = "arguments") {
 function integerOption(value, name, fallback, minimum, maximum) {
   const resolved = value === undefined ? fallback : value;
   if (!Number.isInteger(resolved) || resolved < minimum || resolved > maximum) {
-    throw new HoonsooError(
+    throw new SherpaError(
       "INVALID_ARGUMENT",
       `${name} must be an integer between ${minimum} and ${maximum}.`,
     );
@@ -216,7 +216,7 @@ function integerOption(value, name, fallback, minimum, maximum) {
 
 function requireString(value, name) {
   if (typeof value !== "string" || value.length === 0) {
-    throw new HoonsooError("INVALID_ARGUMENT", `${name} must be a non-empty string.`);
+    throw new SherpaError("INVALID_ARGUMENT", `${name} must be a non-empty string.`);
   }
   return value;
 }
@@ -224,10 +224,10 @@ function requireString(value, name) {
 export function normalizeTargetPath(inputPath) {
   requireString(inputPath, "path");
   if (inputPath.includes("\0")) {
-    throw new HoonsooError("INVALID_PATH", "path must not contain a NUL byte.");
+    throw new SherpaError("INVALID_PATH", "path must not contain a NUL byte.");
   }
   if (!path.isAbsolute(inputPath)) {
-    throw new HoonsooError("INVALID_PATH", "path must be absolute.");
+    throw new SherpaError("INVALID_PATH", "path must be absolute.");
   }
   return path.normalize(path.resolve(inputPath));
 }
@@ -264,14 +264,14 @@ function publicMetadata(metadata) {
 }
 
 function translateFileError(error, targetPath) {
-  if (error instanceof HoonsooError) return error;
+  if (error instanceof SherpaError) return error;
   if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
-    return new HoonsooError("TARGET_NOT_FOUND", `Target does not exist: ${targetPath}`);
+    return new SherpaError("TARGET_NOT_FOUND", `Target does not exist: ${targetPath}`);
   }
   if (error?.code === "EACCES" || error?.code === "EPERM") {
-    return new HoonsooError("TARGET_NOT_READABLE", `Target is not readable: ${targetPath}`);
+    return new SherpaError("TARGET_NOT_READABLE", `Target is not readable: ${targetPath}`);
   }
-  return new HoonsooError("TARGET_READ_FAILED", `Failed to read target: ${targetPath}`, {
+  return new SherpaError("TARGET_READ_FAILED", `Failed to read target: ${targetPath}`, {
     cause: error?.code ?? error?.message ?? String(error),
   });
 }
@@ -280,10 +280,10 @@ async function probeMetadata(targetPath) {
   try {
     const fileStat = await stat(targetPath, { bigint: true });
     if (!fileStat.isFile()) {
-      throw new HoonsooError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
+      throw new SherpaError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
     }
     if (fileStat.size > BigInt(MAX_FILE_BYTES)) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "TARGET_TOO_LARGE",
         `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
       );
@@ -305,7 +305,7 @@ async function readOpenedFileBounded(fileHandle, targetPath) {
     if (bytesRead === 0) break;
     totalBytes += bytesRead;
     if (totalBytes > MAX_FILE_BYTES) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "TARGET_TOO_LARGE",
         `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
       );
@@ -318,7 +318,7 @@ async function readOpenedFileBounded(fileHandle, targetPath) {
   try {
     return UTF8_DECODER.decode(bytes);
   } catch {
-    throw new HoonsooError("TARGET_NOT_UTF8", `Target is not valid UTF-8: ${targetPath}`);
+    throw new SherpaError("TARGET_NOT_UTF8", `Target is not valid UTF-8: ${targetPath}`);
   }
 }
 
@@ -328,10 +328,10 @@ async function readPathOnce(targetPath) {
     fileHandle = await open(targetPath, "r");
     const beforeStat = await fileHandle.stat({ bigint: true });
     if (!beforeStat.isFile()) {
-      throw new HoonsooError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
+      throw new SherpaError("TARGET_NOT_REGULAR_FILE", `Target must be a regular file: ${targetPath}`);
     }
     if (beforeStat.size > BigInt(MAX_FILE_BYTES)) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "TARGET_TOO_LARGE",
         `Target exceeds the ${MAX_FILE_BYTES}-byte limit: ${targetPath}`,
       );
@@ -344,7 +344,7 @@ async function readPathOnce(targetPath) {
       metadataSignature(before) !== metadataSignature(after) ||
       metadataSignature(after) !== metadataSignature(pathMetadata)
     ) {
-      throw new HoonsooError("TARGET_CHANGED_DURING_READ", `Target changed while being read: ${targetPath}`);
+      throw new SherpaError("TARGET_CHANGED_DURING_READ", `Target changed while being read: ${targetPath}`);
     }
     return { text, metadata: after };
   } catch (error) {
@@ -748,7 +748,7 @@ function deltaReference(delta) {
 
 function pageText(text, offset, maxCharacters) {
   if (offset > text.length) {
-    throw new HoonsooError(
+    throw new SherpaError(
       "INVALID_ARGUMENT",
       `offset ${offset} is beyond the snapshot length ${text.length}.`,
     );
@@ -790,7 +790,7 @@ export class MonitorSession {
       24 * 60 * 60 * 1_000,
     );
     if (this.idleStopMs <= this.idleWarningMs) {
-      throw new HoonsooError("INVALID_ARGUMENT", "idleStopMs must be greater than idleWarningMs.");
+      throw new SherpaError("INVALID_ARGUMENT", "idleStopMs must be greater than idleWarningMs.");
     }
     this.reviewLeaseMs = integerOption(
       args.reviewLeaseMs,
@@ -801,7 +801,7 @@ export class MonitorSession {
     );
     this.now = args.now ?? Date.now;
     if (typeof this.now !== "function") {
-      throw new HoonsooError("INVALID_ARGUMENT", "now must be a function.");
+      throw new SherpaError("INVALID_ARGUMENT", "now must be a function.");
     }
     this.monitors = new Map();
     this.activeByPath = new Map();
@@ -822,7 +822,7 @@ export class MonitorSession {
     const active = activeId ? this.monitors.get(activeId) : undefined;
     if (active?.status === "active") {
       if (args.prompt !== undefined && prompt !== active.prompt) {
-        throw new HoonsooError(
+        throw new SherpaError(
           "MONITOR_PROMPT_CONFLICT",
           "An active monitor keeps one immutable invocation prompt. Stop it before starting the same target with a different prompt.",
         );
@@ -964,7 +964,7 @@ export class MonitorSession {
             Number.MAX_SAFE_INTEGER,
           );
     if (revision !== monitor.revision) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "STALE_REVISION",
         "The latest review target is revision " + monitor.revision + ".",
       );
@@ -1070,7 +1070,7 @@ export class MonitorSession {
           reused: true,
         };
       }
-      throw new HoonsooError(
+      throw new SherpaError(
         "FEEDBACK_PUBLISH_CONFLICT",
         "The review token was already consumed by different feedback.",
       );
@@ -1078,20 +1078,20 @@ export class MonitorSession {
 
     const lease = monitor.reviewLease;
     if (!lease || lease.token !== reviewToken) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "REVIEW_TOKEN_INVALID",
         "The review token is not active for this monitor.",
       );
     }
     if (lease.expiresAtMs <= this.now()) {
       this.#expireReviewLease(monitor, reviewToken);
-      throw new HoonsooError("REVIEW_LEASE_EXPIRED", "The review lease has expired.");
+      throw new SherpaError("REVIEW_LEASE_EXPIRED", "The review lease has expired.");
     }
     if (
       lease.revision !== revision ||
       lease.contentHash !== contentHash
     ) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_REVISION_MISMATCH",
         "The review lease does not match the requested revision and content hash.",
       );
@@ -1103,7 +1103,7 @@ export class MonitorSession {
       contentHash,
     );
     if (monitor.publishedRevision !== lease.expectedPublishedRevision) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "PUBLISHED_REVISION_CONFLICT",
         "Published feedback advanced after this review lease was acquired.",
       );
@@ -1111,7 +1111,7 @@ export class MonitorSession {
 
     const existingId = monitor.feedbackArtifactByRevision.get(revision);
     if (existingId) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "FEEDBACK_PUBLISH_CONFLICT",
         "Different feedback already exists for revision " + revision + ".",
       );
@@ -1163,7 +1163,7 @@ export class MonitorSession {
         ? null
         : integerOption(args.timeoutMs, "timeoutMs", 0, 0, MAX_WAIT_MS);
     if (afterRevision > monitor.revision) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "REVISION_AHEAD",
         "afterRevision " +
           afterRevision +
@@ -1302,7 +1302,7 @@ export class MonitorSession {
       ) {
         return { ...this.#publicFieldArtifact(existing), reused: true };
       }
-      throw new HoonsooError(
+      throw new SherpaError(
         "FIELD_ANALYSIS_CONFLICT",
         "A different FieldChecker artifact already exists for revision " + revision + ".",
       );
@@ -1458,7 +1458,7 @@ export class MonitorSession {
       ) {
         return { ...this.#publicFeedbackArtifact(existing), reused: true };
       }
-      throw new HoonsooError(
+      throw new SherpaError(
         "FEEDBACK_DRAFT_CONFLICT",
         "A different feedback artifact already exists for revision " + revision + ".",
       );
@@ -1515,7 +1515,7 @@ export class MonitorSession {
     this.#assertCurrentRevision(monitor, revision, contentHash);
     const artifact = this.#requireFeedbackArtifact(monitor, feedbackArtifactId);
     if (artifact.revision !== revision || artifact.contentHash !== contentHash) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_REVISION_MISMATCH",
         "Feedback artifact does not match the requested revision and content hash.",
       );
@@ -1528,7 +1528,7 @@ export class MonitorSession {
       };
     }
     if (monitor.publishedRevision !== expectedPublishedRevision) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "PUBLISHED_REVISION_CONFLICT",
         "Expected publishedRevision " +
           expectedPublishedRevision +
@@ -1574,13 +1574,13 @@ export class MonitorSession {
 
   #boundedString(value, name, maximum, allowEmpty = false) {
     if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "INVALID_ARGUMENT",
         name + " must be " + (allowEmpty ? "a string" : "a non-empty string") + ".",
       );
     }
     if (value.length > maximum) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "INVALID_ARGUMENT",
         name + " must not exceed " + maximum + " characters.",
       );
@@ -1591,14 +1591,14 @@ export class MonitorSession {
   #requireMonitor(monitorId) {
     requireString(monitorId, "monitorId");
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) throw new HoonsooError("MONITOR_NOT_FOUND", "Unknown monitorId: " + monitorId);
+    if (!monitor) throw new SherpaError("MONITOR_NOT_FOUND", "Unknown monitorId: " + monitorId);
     return monitor;
   }
 
   #requireRevisionArtifact(monitor, revision) {
     const artifact = monitor.revisionArtifacts.get(revision);
     if (!artifact) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "REVISION_NOT_AVAILABLE",
         "Revision " + revision + " is unavailable or has been purged.",
       );
@@ -1609,7 +1609,7 @@ export class MonitorSession {
   #requireDiffArtifact(monitor, artifactId) {
     const artifact = monitor.diffArtifacts.get(artifactId);
     if (!artifact) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_NOT_FOUND",
         "Unknown diffArtifactId for this monitor: " + artifactId,
       );
@@ -1620,7 +1620,7 @@ export class MonitorSession {
   #requireFieldArtifact(monitor, artifactId) {
     const artifact = monitor.fieldArtifacts.get(artifactId);
     if (!artifact) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_NOT_FOUND",
         "Unknown fieldArtifactId for this monitor: " + artifactId,
       );
@@ -1631,7 +1631,7 @@ export class MonitorSession {
   #requireFeedbackArtifact(monitor, artifactId) {
     const artifact = monitor.feedbackArtifacts.get(artifactId);
     if (!artifact) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_NOT_FOUND",
         "Unknown feedbackArtifactId for this monitor: " + artifactId,
       );
@@ -1641,7 +1641,7 @@ export class MonitorSession {
 
   #assertCurrentRevision(monitor, revision, contentHash) {
     if (monitor.status !== "active") {
-      throw new HoonsooError(
+      throw new SherpaError(
         "MONITOR_NOT_ACTIVE",
         "Monitor is not active: " + monitor.id,
       );
@@ -1652,7 +1652,7 @@ export class MonitorSession {
       contentHash !== monitor.currentContentHash ||
       contentHash !== current.contentHash
     ) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "STALE_REVISION",
         "Expected current revision " +
           monitor.revision +
@@ -1671,7 +1671,7 @@ export class MonitorSession {
         revisionArtifact.revision !== revision ||
         revisionArtifact.contentHash !== contentHash
       ) {
-        throw new HoonsooError(
+        throw new SherpaError(
           "ARTIFACT_REVISION_MISMATCH",
           "Revision artifact does not match the requested CAS values.",
         );
@@ -1684,14 +1684,14 @@ export class MonitorSession {
         diffArtifact.revision !== revision ||
         diffArtifact.contentHash !== contentHash
       ) {
-        throw new HoonsooError(
+        throw new SherpaError(
           "ARTIFACT_REVISION_MISMATCH",
           "Diff artifact does not match the requested CAS values.",
         );
       }
       return { kind: "diff", artifact: diffArtifact };
     }
-    throw new HoonsooError(
+    throw new SherpaError(
       "ARTIFACT_NOT_FOUND",
       "Unknown sourceArtifactId for this monitor: " + artifactId,
     );
@@ -1817,7 +1817,7 @@ export class MonitorSession {
       fieldArtifact.contentHash !== contentHash ||
       fieldArtifact.sourceArtifactId !== sourceArtifactId
     ) {
-      throw new HoonsooError(
+      throw new SherpaError(
         "ARTIFACT_REVISION_MISMATCH",
         "Field artifact does not match the requested revision, hash, and source.",
       );
@@ -2294,9 +2294,9 @@ function toolSuccess(data) {
 
 function toolFailure(error) {
   const normalized =
-    error instanceof HoonsooError
+    error instanceof SherpaError
       ? error
-      : new HoonsooError("INTERNAL_ERROR", error?.message ?? String(error));
+      : new SherpaError("INTERNAL_ERROR", error?.message ?? String(error));
   const data = {
     error: {
       code: normalized.code,
@@ -2334,7 +2334,7 @@ export async function callTool(session, name, args, signal = undefined) {
         result = session.stopMonitor(args);
         break;
       default:
-        throw new HoonsooError("TOOL_NOT_FOUND", `Unknown tool: ${name}`);
+        throw new SherpaError("TOOL_NOT_FOUND", `Unknown tool: ${name}`);
     }
     return toolSuccess(result);
   } catch (error) {
@@ -2409,7 +2409,7 @@ export function createMcpServer({ input = process.stdin, output = process.stdout
               capabilities: { tools: { listChanged: false } },
               serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
               instructions:
-                "Hoonsoo 0.4 uses exactly six tools in an inline current-host flow: start_monitor, read_review_context, publish_feedback, wait_for_save, get_status, and stop_monitor. The current host must perform the review itself; do not use subagents because session memory is process-local. Hoonsoo only reads explicitly selected UTF-8 regular files and never writes to the target or workspace.",
+                "Sherpa 0.5 uses exactly six tools in an inline current-host flow: start_monitor, read_review_context, publish_feedback, wait_for_save, get_status, and stop_monitor. The current host must perform the review itself; do not use subagents because session memory is process-local. Sherpa only reads explicitly selected UTF-8 regular files and never writes to the target or workspace.",
             }),
           );
           break;

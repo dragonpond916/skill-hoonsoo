@@ -32,9 +32,10 @@ const retiredTools = [
 ];
 
 test("skill contract defines the six-tool single-pass fast path", async () => {
-  const skill = await read("skills/hoonsoo/SKILL.md");
+  const skill = await read("skills/sherpa/SKILL.md");
 
-  assert.match(skill, /\$hoonsoo <filepath> <prompt>/);
+  assert.match(skill, /\$sherpa <filepath> <prompt>/);
+  assert.match(skill, /\/skill-sherpa:sherpa <filepath> <prompt>/);
   assert.match(skill, /content.*grammar|grammar.*content/is);
   assert.match(skill, /disk-backed|persisted to disk|saved revision/is);
   assert.match(skill, /metadata/is);
@@ -51,35 +52,38 @@ test("skill contract defines the six-tool single-pass fast path", async () => {
   for (const toolName of publicTools) assert.match(skill, new RegExp(`\\b${toolName}\\b`));
   for (const toolName of retiredTools) assert.doesNotMatch(skill, new RegExp(`\\b${toolName}\\b`));
 
-  assert.match(skill, /\{n\} 번째 훈수 :/);
+  assert.match(skill, /세르파의 \{n\}번째 조언 :/);
   assert.match(skill, /Do not display `revision:`/);
   assert.doesNotMatch(skill, /revision: \{revision\}/);
   assert.match(
     skill,
-    /1분 간, 작업이 감지되지 않습니다\. 추가 30초 대기 후, 훈수모드가 정지됩니다\./,
+    /1분간 작업이 감지되지 않았습니다\. 30초 더 기다린 후 세르파 모드가 정지됩니다\./,
   );
-  assert.doesNotMatch(skill, /gpt-5\.6-luna|gpt-5\.6-sol|hoonsoo-field-checker|hoonsoo-advisor/);
+  assert.doesNotMatch(skill, /gpt-5\.6-luna|gpt-5\.6-sol|sherpa-field-checker|sherpa-advisor/);
+  assert.doesNotMatch(skill, /\$hoonsoo|\/skill-hoonsoo:hoonsoo|\bHoonsoo\b/);
   assert.doesNotMatch(skill, /전용 검토 에이전트가.*세션 메모리를 공유하지 못하는 환경/);
   assert.doesNotMatch(skill, /settleMs|pendingMeaningfulChange|ignore-whitespace-only/);
-  assert.doesNotMatch(skill, /<context \| grammar>|\/hoonsoo:context|\/hoonsoo:grammar/);
+  assert.doesNotMatch(skill, /<context \| grammar>|\/sherpa:context|\/sherpa:grammar/);
 });
 
 test("retired subagent definitions are not packaged", async () => {
-  await assert.rejects(read("agents/hoonsoo-field-checker.md"), { code: "ENOENT" });
-  await assert.rejects(read("agents/hoonsoo-advisor.md"), { code: "ENOENT" });
+  await assert.rejects(read("agents/sherpa-field-checker.md"), { code: "ENOENT" });
+  await assert.rejects(read("agents/sherpa-advisor.md"), { code: "ENOENT" });
 });
 
-test("documentation and design reference describe the 0.4.0 fast path", async () => {
+test("documentation and design reference describe the 0.5.0 Sherpa fast path", async () => {
   const readme = await read("README.md");
   const packageMetadata = JSON.parse(await read("package.json"));
-  const manifest = JSON.parse(await read("examples/hoonsoo.manifest.json"));
-  const schema = JSON.parse(await read("schemas/hoonsoo.manifest.schema.json"));
+  const manifest = JSON.parse(await read("examples/sherpa.manifest.json"));
+  const schema = JSON.parse(await read("schemas/sherpa.manifest.schema.json"));
   const serializedManifest = JSON.stringify(manifest);
 
-  assert.equal(packageMetadata.version, "0.4.0");
-  assert.equal(manifest.schemaVersion, "0.4.0");
-  assert.match(schema.$id, /0\.4\.0$/);
-  assert.equal(manifest.command.codexInvocation, "$hoonsoo <filePath> <prompt>");
+  assert.equal(packageMetadata.version, "0.5.0");
+  assert.equal(manifest.schemaVersion, "0.5.0");
+  assert.equal(manifest.kind, "SherpaSkill");
+  assert.equal(manifest.metadata.name, "sherpa");
+  assert.match(schema.$id, /0\.5\.0$/);
+  assert.equal(manifest.command.codexInvocation, "$sherpa <filePath> <prompt>");
   assert.equal(manifest.command.reviewScope, "content-and-grammar");
   assert.equal(manifest.watch.pollIntervalMs, 250);
   assert.equal(manifest.watch.throttling.enabled, false);
@@ -97,6 +101,9 @@ test("documentation and design reference describe the 0.4.0 fast path", async ()
   assert.deepEqual([...configuredTools].sort(), [...publicTools].sort());
 
   assert.match(readme, /0\.4\.0 성능 개선/);
+  assert.match(readme, /0\.5\.0 이름 변경/);
+  assert.match(readme, /제품 이름과 공개 식별자를 `Hoonsoo`에서 `Sherpa`로 변경/);
+  assert.match(readme, /dragonpond916\/skill-hoonsoo.*유지/s);
   assert.match(readme, /MONITOR_NOT_FOUND/);
   assert.match(readme, /현재 host model이 직접 응답/);
   assert.match(readme, /한 번의 LLM pass/);
@@ -104,14 +111,14 @@ test("documentation and design reference describe the 0.4.0 fast path", async ()
   assert.match(readme, /분석 lease.*idle/is);
   assert.match(readme, /내부 `revision:` 라벨을 제거/);
   assert.match(readme, /수동 Save와 autosave를 구분하지 못합니다/);
-  assert.doesNotMatch(readme, /gpt-5\.6-luna|gpt-5\.6-sol|hoonsoo-field-checker|hoonsoo-advisor/);
+  assert.doesNotMatch(readme, /gpt-5\.6-luna|gpt-5\.6-sol|sherpa-field-checker|sherpa-advisor/);
 });
 
-test("Codex skill metadata keeps only Hoonsoo as a hard dependency", async () => {
-  const metadata = await read("skills/hoonsoo/agents/openai.yaml");
+test("Codex skill metadata keeps only Sherpa as a hard dependency", async () => {
+  const metadata = await read("skills/sherpa/agents/openai.yaml");
   assert.equal((metadata.match(/^    - type: "mcp"$/gm) ?? []).length, 1);
-  assert.match(metadata, /^      value: "hoonsoo"$/m);
-  assert.match(metadata, /\$hoonsoo/);
+  assert.match(metadata, /^      value: "sherpa"$/m);
+  assert.match(metadata, /\$sherpa/);
   assert.match(metadata, /one current-host pass/);
   assert.match(metadata, /without subagents/i);
 });
