@@ -1,12 +1,14 @@
 {
   "$schema": "../schemas/sherpa.manifest.schema.json",
-  "schemaVersion": "0.5.0",
+  "schemaVersion": "0.6.0",
   "kind": "SherpaSkill",
   "metadata": {
     "name": "sherpa",
     "displayName": "Sherpa",
-    "version": "0.5.0",
-    "description": "Review document content and grammar in one current-host pass after stable saved states without modifying the source file.",
+    "version": "0.6.0",
+    "description": "Review document content and grammar from review contexts embedded in monitor start and saved-revision results without modifying the source file.",
+    "homepage": "https://github.com/dragonpond916/skill-sherpa",
+    "repository": "https://github.com/dragonpond916/skill-sherpa",
     "keywords": [
       "advice-only",
       "save-triggered-review",
@@ -76,7 +78,7 @@
   },
   "watch": {
     "mode": "metadata-polling",
-    "pollIntervalMs": 250,
+    "pollIntervalMs": 25,
     "throttling": {
       "enabled": false
     },
@@ -135,11 +137,11 @@
       "role": "combined-reviewer",
       "implementation": "current-host",
       "modelClass": "current-host",
-      "responsibility": "Read one review context and produce combined content and grammar advice in a single current-host model pass without spawning a subagent.",
+      "responsibility": "Consume the review context embedded by monitor start or saved-revision results and produce combined content and grammar advice in a single current-host model pass without spawning a subagent.",
       "inputs": [
         "review-context",
         "invocation-prompt",
-        "recent-published-feedback"
+        "conversation-history"
       ],
       "outputs": [
         "natural-language-feedback"
@@ -153,11 +155,11 @@
       "responsibility": "Reject feedback whose review lease, revision, content hash, or source artifact no longer matches current monitor state.",
       "inputs": [
         "review-lease",
-        "feedback",
+        "revision-content-hash-identifiers",
         "runtime-status"
       ],
       "outputs": [
-        "published-feedback",
+        "publication-marker",
         "stale-decision"
       ],
       "effectPolicy": "validate-and-update-session-memory-only"
@@ -181,11 +183,12 @@
       "role": "host-session-orchestrator",
       "implementation": "host-agent",
       "modelClass": "current-host",
-      "responsibility": "Manage monitor lifecycle, request one inline review, publish accepted natural-language feedback, and perform bounded waits with silent retries.",
+      "responsibility": "Manage monitor lifecycle, consume embedded review contexts on the normal path, recover context only when necessary, publish accepted natural-language feedback, and perform bounded waits with silent retries.",
       "inputs": [
         "runtime-status",
-        "review-context",
-        "published-feedback"
+        "embedded-review-context",
+        "recovery-review-context",
+        "publication-marker"
       ],
       "outputs": [
         "numbered-advice-batch"
@@ -203,10 +206,16 @@
     ],
     "baseline": {
       "internalRevision": 0,
-      "reviewInput": "full-revision-context"
+      "reviewInput": "full-revision-context",
+      "contextDelivery": "embedded-in-start_monitor"
     },
     "savedRevision": {
-      "reviewInput": "aggregate-diff-context"
+      "reviewInput": "aggregate-diff-context",
+      "contextDelivery": "embedded-in-wait_for_save"
+    },
+    "recoveryReviewContext": {
+      "tool": "read_review_context",
+      "usage": "recovery-only"
     },
     "reviewPassesPerRevision": 1,
     "reviewExecution": "current-host-inline",

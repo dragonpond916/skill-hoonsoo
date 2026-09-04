@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/dragonpond916/skill-hoonsoo/schemas/sherpa.manifest/0.5.0",
+  "$id": "https://github.com/dragonpond916/skill-sherpa/schemas/sherpa.manifest/0.6.0",
   "title": "Sherpa fast saved-review manifest",
   "type": "object",
   "additionalProperties": false,
@@ -26,7 +26,7 @@
       "const": "../schemas/sherpa.manifest.schema.json"
     },
     "schemaVersion": {
-      "const": "0.5.0"
+      "const": "0.6.0"
     },
     "kind": {
       "const": "SherpaSkill"
@@ -39,6 +39,8 @@
         "displayName",
         "version",
         "description",
+        "homepage",
+        "repository",
         "keywords"
       ],
       "properties": {
@@ -49,10 +51,16 @@
           "const": "Sherpa"
         },
         "version": {
-          "const": "0.5.0"
+          "const": "0.6.0"
         },
         "description": {
           "$ref": "#/$defs/nonEmptyString"
+        },
+        "homepage": {
+          "const": "https://github.com/dragonpond916/skill-sherpa"
+        },
+        "repository": {
+          "const": "https://github.com/dragonpond916/skill-sherpa"
         },
         "keywords": {
           "$ref": "#/$defs/nonEmptyStringArray"
@@ -223,7 +231,7 @@
           "const": "metadata-polling"
         },
         "pollIntervalMs": {
-          "const": 250
+          "const": 25
         },
         "throttling": {
           "type": "object",
@@ -377,6 +385,7 @@
         "sequence",
         "baseline",
         "savedRevision",
+        "recoveryReviewContext",
         "reviewPassesPerRevision",
         "reviewExecution",
         "subagentPolicy",
@@ -400,7 +409,8 @@
           "additionalProperties": false,
           "required": [
             "internalRevision",
-            "reviewInput"
+            "reviewInput",
+            "contextDelivery"
           ],
           "properties": {
             "internalRevision": {
@@ -408,6 +418,9 @@
             },
             "reviewInput": {
               "const": "full-revision-context"
+            },
+            "contextDelivery": {
+              "const": "embedded-in-start_monitor"
             }
           }
         },
@@ -415,11 +428,31 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "reviewInput"
+            "reviewInput",
+            "contextDelivery"
           ],
           "properties": {
             "reviewInput": {
               "const": "aggregate-diff-context"
+            },
+            "contextDelivery": {
+              "const": "embedded-in-wait_for_save"
+            }
+          }
+        },
+        "recoveryReviewContext": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "usage"
+          ],
+          "properties": {
+            "tool": {
+              "const": "read_review_context"
+            },
+            "usage": {
+              "const": "recovery-only"
             }
           }
         },

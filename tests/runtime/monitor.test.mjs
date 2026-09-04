@@ -59,6 +59,47 @@ async function waitForSaved(session, monitorId, afterRevision, milliseconds = 1_
   return result;
 }
 
+function assertLeanReviewContext(context, inputKind) {
+  assert.equal(context.state, "review-ready");
+  assert.equal(context.input.kind, inputKind);
+  assert.equal(typeof context.input.content, "string");
+  assert.equal(typeof context.input.truncated, "boolean");
+  assert.equal(Object.hasOwn(context, "excerpt"), false);
+  assert.equal(Object.hasOwn(context, "documentContext"), false);
+  assert.equal(Object.hasOwn(context, "recentPublishedFeedback"), false);
+  if (inputKind === "document") {
+    assert.equal(typeof context.input.totalCharacters, "number");
+    assert.deepEqual(Object.keys(context.input).sort(), [
+      "content",
+      "kind",
+      "totalCharacters",
+      "truncated",
+    ]);
+  } else {
+    assert.ok(Array.isArray(context.input.changedRanges));
+    assert.deepEqual(Object.keys(context.input).sort(), [
+      "changedRanges",
+      "content",
+      "kind",
+      "truncated",
+    ]);
+  }
+}
+
+function assertNoReviewContext(result) {
+  assert.equal(Object.hasOwn(result, "reviewContext"), false);
+}
+
+function publishEmbeddedReview(session, context, feedback = undefined) {
+  return session.publishFeedback({
+    monitorId: context.monitorId,
+    reviewToken: context.reviewToken,
+    revision: context.revision,
+    contentHash: context.contentHash,
+    ...(feedback === undefined ? {} : { feedback }),
+  });
+}
+
 after(async () => {
   for (const session of sessions) session.close();
   await Promise.all(
@@ -112,6 +153,13 @@ test("starts with a versioned baseline and reads exact revision pages", async ()
   assert.equal(started.promptPresent, true);
   assert.match(started.promptRef, /^prompt-monitor-\d+-[a-f0-9]{16}$/);
   assert.equal("settleMs" in started, false);
+  assertLeanReviewContext(started.reviewContext, "document");
+  assert.equal(started.reviewContext.revision, 0);
+  assert.equal(started.reviewContext.contentHash, started.contentHash);
+  assert.equal(started.reviewContext.sourceArtifactId, started.revisionArtifactId);
+  assert.equal(started.reviewContext.sourceKind, "revision");
+  assert.equal(started.reviewContext.input.content, "0123456789");
+  assert.equal(started.reviewContext.input.totalCharacters, 10);
 
   const first = session.readRevision({
     monitorId: started.monitorId,
@@ -137,30 +185,42 @@ test("starts with a versioned baseline and reads exact revision pages", async ()
   assert.equal(reused.monitorId, started.monitorId);
   assert.equal(reused.reused, true);
   assert.equal(reused.pollIntervalMs, 30);
+  assert.equal(reused.reviewContext.reviewToken, started.reviewContext.reviewToken);
+  assert.equal(reused.reviewContext.reused, true);
   await assert.rejects(
     session.startMonitor({ path: target, prompt: "Use a different focus." }),
     (error) => error.code === "MONITOR_PROMPT_CONFLICT",
   );
 });
 
-test("uses the 250ms default poll and immediately probes after registering a waiter", async () => {
+test("uses the 25ms default poll and immediately probes after registering a waiter", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "document.md");
   await writeFile(target, "before", "utf8");
   const session = new MonitorSession();
   sessions.push(session);
   const started = await session.startMonitor({ path: target });
-  assert.equal(started.pollIntervalMs, 250);
+  assert.equal(started.pollIntervalMs, 25);
   assert.equal(started.reviewLeaseMs, DEFAULT_REVIEW_LEASE_MS);
+  session.publishFeedback({
+    monitorId: started.monitorId,
+    reviewToken: started.reviewContext.reviewToken,
+    revision: 0,
+    contentHash: started.contentHash,
+    feedback: "baseline",
+  });
 
   await writeFile(target, "after", "utf8");
   const savedAt = Date.now();
   const saved = await waitForSaved(session, started.monitorId, 0);
   assert.equal(saved.event.revision, 1);
-  assert.ok(Date.now() - savedAt < 500, "save detection exceeded the fast-path bound");
+  assertLeanReviewContext(saved.reviewContext, "diff");
+  assert.equal(saved.reviewContext.revision, 1);
+  assert.ok(Date.now() - savedAt < 200, "save detection exceeded the 25ms fast-path bound");
 
   const reused = await session.startMonitor({ path: target });
-  assert.equal(reused.pollIntervalMs, 250);
+  assert.equal(reused.pollIntervalMs, 25);
+  assert.equal(reused.reviewContext.reviewToken, saved.reviewContext.reviewToken);
   const slowed = await session.startMonitor({ path: target, pollIntervalMs: 60_000 });
   assert.equal(slowed.pollIntervalMs, 60_000);
   const reusedWithoutOverride = await session.startMonitor({ path: target });
@@ -170,6 +230,7 @@ test("uses the 250ms default poll and immediately probes after registering a wai
   const immediateAt = Date.now();
   const immediatelyDetected = await waitForSaved(session, started.monitorId, 1);
   assert.equal(immediatelyDetected.event.revision, 2);
+  assertLeanReviewContext(immediatelyDetected.reviewContext, "diff");
   assert.ok(
     Date.now() - immediateAt < 500,
     "waiter registration did not trigger an immediate probe",
@@ -188,16 +249,15 @@ test("reviews and publishes directly with a revision-bound idempotent lease", as
     pollIntervalMs: 25,
   });
 
-  const context = session.readReviewContext({ monitorId: started.monitorId });
-  assert.equal(context.state, "review-ready");
+  const context = started.reviewContext;
+  assertLeanReviewContext(context, "document");
   assert.equal(context.revision, 0);
   assert.equal(context.contentHash, started.contentHash);
   assert.equal(context.prompt, "Check meaning and grammar.");
   assert.equal(context.sourceArtifactId, started.revisionArtifactId);
   assert.equal(context.sourceKind, "revision");
   assert.equal(context.rebaselineRequired, false);
-  assert.equal(context.documentContext.content, "baseline content");
-  assert.equal(context.recentPublishedFeedback.length, 0);
+  assert.equal(context.input.content, "baseline content");
   assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, true);
 
   const repeatedContext = session.readReviewContext({
@@ -207,6 +267,9 @@ test("reviews and publishes directly with a revision-bound idempotent lease", as
   assert.equal(repeatedContext.reviewToken, context.reviewToken);
   assert.equal(repeatedContext.leaseExpiresAt, context.leaseExpiresAt);
   assert.equal(repeatedContext.reused, true);
+  assert.equal(repeatedContext.documentContext.content, context.input.content);
+  assert.equal(repeatedContext.documentContext.totalCharacters, context.input.totalCharacters);
+  assert.equal(Object.hasOwn(repeatedContext, "input"), false);
 
   assert.throws(() => session.publishFeedback({
     monitorId: started.monitorId,
@@ -230,6 +293,10 @@ test("reviews and publishes directly with a revision-bound idempotent lease", as
   assert.equal(published.publishedRevision, 0);
   assert.equal(published.reused, false);
   assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, false);
+  assert.equal(
+    (await session.startMonitor({ path: target })).reviewContext,
+    null,
+  );
 
   const retried = session.publishFeedback({
     monitorId: started.monitorId,
@@ -260,7 +327,7 @@ test("suspends idle lifecycle during analysis and restarts it after publish", as
   });
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
-  const context = session.readReviewContext({ monitorId: started.monitorId });
+  const context = started.reviewContext;
 
   await delay(160);
   const duringAnalysis = session.getStatus({ monitorId: started.monitorId });
@@ -274,6 +341,7 @@ test("suspends idle lifecycle during analysis and restarts it after publish", as
     timeoutMs: 20,
   });
   assert.equal(diagnostic.state, "timeout");
+  assertNoReviewContext(diagnostic);
 
   const publishedAt = Date.now();
   session.publishFeedback({
@@ -287,11 +355,13 @@ test("suspends idle lifecycle during analysis and restarts it after publish", as
     session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
   assert.equal(warning.state, "idle-warning");
+  assertNoReviewContext(warning);
   assert.ok(Date.now() - publishedAt >= 50, "idle clock did not restart at publish time");
   const stopped = await withDeadline(
     session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
   assert.equal(stopped.state, "idle-stopped");
+  assertNoReviewContext(stopped);
   assert.equal(stopped.purged, true);
 });
 
@@ -306,7 +376,7 @@ test("expires an abandoned review lease before restarting idle time", async () =
   });
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
-  const context = session.readReviewContext({ monitorId: started.monitorId });
+  const context = started.reviewContext;
 
   await delay(85);
   const expired = session.getStatus({ monitorId: started.monitorId });
@@ -326,6 +396,7 @@ test("expires an abandoned review lease before restarting idle time", async () =
     session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
   assert.equal(warning.state, "idle-warning");
+  assertNoReviewContext(warning);
 });
 
 test("makes an old review lease stale when a newer save is observed", async () => {
@@ -335,7 +406,7 @@ test("makes an old review lease stale when a newer save is observed", async () =
   const session = new MonitorSession({ reviewLeaseMs: 500 });
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
-  const baseline = session.readReviewContext({ monitorId: started.monitorId });
+  const baseline = started.reviewContext;
   session.publishFeedback({
     monitorId: started.monitorId,
     reviewToken: baseline.reviewToken,
@@ -347,7 +418,7 @@ test("makes an old review lease stale when a newer save is observed", async () =
 
   await writeFile(target, "one", "utf8");
   const saved = await waitForSaved(session, started.monitorId, 0);
-  assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, false);
+  assert.equal(session.getStatus({ monitorId: started.monitorId }).reviewLease.active, true);
   assert.throws(() => session.publishFeedback({
     monitorId: started.monitorId,
     reviewToken: oldLease.reviewToken,
@@ -356,17 +427,20 @@ test("makes an old review lease stale when a newer save is observed", async () =
     feedback: "obsolete feedback",
   }), { code: "STALE_REVISION" });
 
-  const latest = session.readReviewContext({
+  const latest = saved.reviewContext;
+  assertLeanReviewContext(latest, "diff");
+  assert.equal(latest.sourceArtifactId, saved.event.diffArtifactId);
+  assert.equal(latest.rebaselineRequired, false);
+  const recovered = session.readReviewContext({
     monitorId: started.monitorId,
     revision: saved.event.revision,
   });
-  assert.equal(latest.sourceKind, "diff");
-  assert.equal(latest.sourceArtifactId, saved.event.diffArtifactId);
-  assert.equal(latest.rebaselineRequired, false);
-  assert.deepEqual(
-    latest.recentPublishedFeedback.map(({ revision, feedback }) => ({ revision, feedback })),
-    [{ revision: 0, feedback: "baseline feedback" }],
-  );
+  assert.equal(recovered.reviewToken, latest.reviewToken);
+  assert.equal(recovered.leaseExpiresAt, latest.leaseExpiresAt);
+  assert.equal(recovered.reused, true);
+  assert.equal(recovered.excerpt.content, latest.input.content);
+  assert.deepEqual(recovered.excerpt.changedRanges, latest.input.changedRanges);
+  assert.equal(Object.hasOwn(recovered, "input"), false);
   const published = session.publishFeedback({
     monitorId: started.monitorId,
     reviewToken: latest.reviewToken,
@@ -405,6 +479,7 @@ test("detects same-size saves and exposes an immediate refs-only diff artifact",
   const session = new MonitorSession();
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  publishEmbeddedReview(session, started.reviewContext);
 
   await writeFile(target, "dog", "utf8");
   const saved = await waitForSaved(session, started.monitorId, 0);
@@ -413,6 +488,9 @@ test("detects same-size saves and exposes an immediate refs-only diff artifact",
   assert.equal(saved.event.metadata.sizeBytes, 3);
   assert.equal(saved.event.diffArtifactId, `diff-${started.monitorId}-0-1`);
   assert.equal("content" in saved.event, false);
+  assertLeanReviewContext(saved.reviewContext, "diff");
+  assert.equal(saved.reviewContext.input.content.includes("-cat"), true);
+  assert.equal(saved.reviewContext.input.content.includes("+dog"), true);
 
   const diff = session.readDiffArtifact({
     monitorId: started.monitorId,
@@ -432,11 +510,13 @@ test("treats whitespace-only saves as grammar-relevant content revisions", async
   const session = new MonitorSession();
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  publishEmbeddedReview(session, started.reviewContext);
 
   await writeFile(target, "alpha  beta\n\ngamma", "utf8");
   const saved = await waitForSaved(session, started.monitorId, 0);
   assert.equal(saved.event.revision, 1);
   assert.notEqual(saved.event.contentHash, started.contentHash);
+  assertLeanReviewContext(saved.reviewContext, "diff");
   assert.equal(
     session.readRevision({ monitorId: started.monitorId, revision: 1 }).content,
     "alpha  beta\n\ngamma",
@@ -449,8 +529,9 @@ test("same-content saves increment saveSequence without revision, wake-up, or id
   await writeFile(target, "unchanged", "utf8");
   const session = new MonitorSession({ idleWarningMs: 110, idleStopMs: 190 });
   sessions.push(session);
-  const startedAt = Date.now();
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  publishEmbeddedReview(session, started.reviewContext);
+  const startedAt = Date.now();
 
   await delay(50);
   await writeFile(target, "unchanged", "utf8");
@@ -464,10 +545,12 @@ test("same-content saves increment saveSequence without revision, wake-up, or id
   });
   assert.equal(noRevision.state, "timeout");
   assert.equal(noRevision.revision, 0);
+  assertNoReviewContext(noRevision);
   const warning = await withDeadline(
     session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
   assert.equal(warning.state, "idle-warning");
+  assertNoReviewContext(warning);
   assert.ok(Date.now() - startedAt < 165, "same-content save unexpectedly reset idle time");
 });
 
@@ -478,16 +561,19 @@ test("processes sequential saves without throttling and preserves aggregate diff
   const session = new MonitorSession();
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  publishEmbeddedReview(session, started.reviewContext);
 
   const savedAt = Date.now();
   await writeFile(target, "one", "utf8");
   const first = await waitForSaved(session, started.monitorId, 0);
   assert.ok(Date.now() - savedAt < 500, "save waited for a removed throttle window");
   assert.equal(first.event.revision, 1);
+  assertLeanReviewContext(first.reviewContext, "diff");
   await writeFile(target, "two", "utf8");
   const second = await waitForSaved(session, started.monitorId, 1);
   assert.equal(second.event.revision, 2);
   assert.equal(second.event.diffArtifactId, `diff-${started.monitorId}-1-2`);
+  assertLeanReviewContext(second.reviewContext, "diff");
 
   const aggregate = await session.waitForSave({
     monitorId: started.monitorId,
@@ -497,6 +583,8 @@ test("processes sequential saves without throttling and preserves aggregate diff
   assert.equal(aggregate.state, "saved");
   assert.equal(aggregate.event.revision, 2);
   assert.equal(aggregate.event.diffArtifactId, `diff-${started.monitorId}-0-2`);
+  assertLeanReviewContext(aggregate.reviewContext, "diff");
+  assert.equal(aggregate.reviewContext.sourceArtifactId, aggregate.event.diffArtifactId);
   const aggregateDiff = session.readDiffArtifact({
     monitorId: started.monitorId,
     diffArtifactId: aggregate.event.diffArtifactId,
@@ -716,6 +804,7 @@ test("confirms deletion after two missing probes and purges session artifacts", 
   await unlink(target);
   const deleted = await withDeadline(waiting);
   assert.equal(deleted.state, "deleted");
+  assertNoReviewContext(deleted);
   assert.equal(deleted.reason, "target-deleted");
   assert.equal(deleted.purged, true);
   assert.equal(deleted.revisionArtifactId, null);
@@ -731,25 +820,30 @@ test("keeps idle warning/stop and resets idle only for changed content", async (
   const session = new MonitorSession({ idleWarningMs: 70, idleStopMs: 130 });
   sessions.push(session);
   const started = await session.startMonitor({ path: target, pollIntervalMs: 25 });
+  publishEmbeddedReview(session, started.reviewContext);
   const warning = await withDeadline(
     session.waitForSave({ monitorId: started.monitorId, afterRevision: 0 }),
   );
   assert.equal(warning.state, "idle-warning");
+  assertNoReviewContext(warning);
   assert.equal(warning.message, IDLE_WARNING_MESSAGE);
 
   await writeFile(target, "after", "utf8");
   const saved = await waitForSaved(session, started.monitorId, 0);
+  publishEmbeddedReview(session, saved.reviewContext);
   const secondWarning = await session.waitForSave({
     monitorId: started.monitorId,
     afterRevision: saved.event.revision,
     timeoutMs: 500,
   });
   assert.equal(secondWarning.state, "idle-warning");
+  assertNoReviewContext(secondWarning);
   const stopped = await withDeadline(session.waitForSave({
     monitorId: started.monitorId,
     afterRevision: saved.event.revision,
   }));
   assert.equal(stopped.state, "idle-stopped");
+  assertNoReviewContext(stopped);
   assert.equal(stopped.purged, true);
 });
 
@@ -771,6 +865,7 @@ test("explicit stop resolves waits and purges prompt, revisions, and artifacts",
   assert.equal(stoppedStatus.purged, true);
   assert.equal(stoppedStatus.promptPresent, false);
   assert.equal(stoppedWait.state, "stopped");
+  assertNoReviewContext(stoppedWait);
   assert.throws(() => session.readRevision({ monitorId: started.monitorId, revision: 0 }), {
     code: "REVISION_NOT_AVAILABLE",
   });

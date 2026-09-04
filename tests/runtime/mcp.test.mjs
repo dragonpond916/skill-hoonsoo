@@ -129,7 +129,7 @@ afterEach(async () => {
   );
 });
 
-test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async () => {
+test("serves the 0.6.0 six-tool fast review lifecycle over JSONL stdio", async () => {
   const directory = await temporaryDirectory();
   const target = path.join(directory, "large-document.md");
   await writeFile(target, "x".repeat(100_000), "utf8");
@@ -143,7 +143,7 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
   });
   assert.equal(initialize.result.protocolVersion, "2024-11-05");
   assert.equal(initialize.result.serverInfo.name, "sherpa");
-  assert.equal(initialize.result.serverInfo.version, "0.5.0");
+  assert.equal(initialize.result.serverInfo.version, "0.6.0");
   assert.deepEqual(initialize.result.capabilities, { tools: { listChanged: false } });
   assert.match(initialize.result.instructions.slice(0, 512), /six tools/i);
   assert.match(initialize.result.instructions.slice(0, 512), /current host/i);
@@ -176,12 +176,21 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
   assert.deepEqual(startDefinition.inputSchema.required, ["path"]);
   assert.equal(Object.hasOwn(startDefinition.inputSchema.properties, "settleMs"), false);
   assert.equal(startDefinition.inputSchema.properties.prompt.maxLength, 8_000);
-  assert.equal(startDefinition.inputSchema.properties.pollIntervalMs.default, 250);
+  assert.equal(startDefinition.inputSchema.properties.pollIntervalMs.default, 25);
   const waitDefinition = listed.result.tools.find((tool) => tool.name === "wait_for_save");
   assert.equal(
     Object.hasOwn(waitDefinition.inputSchema.properties.timeoutMs, "default"),
     false,
   );
+  const publishDefinition = listed.result.tools.find(
+    (tool) => tool.name === "publish_feedback",
+  );
+  assert.deepEqual(publishDefinition.inputSchema.required, [
+    "monitorId",
+    "reviewToken",
+    "revision",
+    "contentHash",
+  ]);
 
   const startCall = await client.request("tools/call", {
     name: "start_monitor",
@@ -191,41 +200,61 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
   const started = startCall.result.structuredContent;
   assert.equal(started.status, "active");
   assert.equal(started.revision, 0);
-  assert.equal(started.pollIntervalMs, 250);
+  assert.equal(started.pollIntervalMs, 25);
   assert.match(started.promptRef, /^prompt-monitor-\d+-[a-f0-9]{16}$/);
-  const compactStart = JSON.parse(startCall.result.content[0].text);
-  assert.equal(compactStart.monitorId, started.monitorId);
-  assert.equal(Object.hasOwn(compactStart, "path"), false);
-
-  const contextCall = await client.request("tools/call", {
-    name: "read_review_context",
-    arguments: { monitorId: started.monitorId },
-  });
-  const context = contextCall.result.structuredContent;
+  const context = started.reviewContext;
   assert.equal(context.state, "review-ready");
   assert.equal(context.revision, 0);
   assert.equal(context.contentHash, started.contentHash);
   assert.equal(context.sourceKind, "revision");
   assert.equal(context.sourceArtifactId, started.revisionArtifactId);
   assert.equal(context.prompt, "Review content and grammar.");
-  assert.equal(context.excerpt.content.length, 12_000);
-  assert.equal(context.documentContext.content.length, 32_000);
-  assert.equal(context.documentContext.totalCharacters, 100_000);
-  assert.equal(context.documentContext.truncated, true);
+  assert.equal(context.input.kind, "document");
+  assert.equal(context.input.content.length, 32_000);
+  assert.equal(context.input.totalCharacters, 100_000);
+  assert.equal(context.input.truncated, true);
+  assert.deepEqual(Object.keys(context.input).sort(), [
+    "content",
+    "kind",
+    "totalCharacters",
+    "truncated",
+  ]);
+  assert.equal(Object.hasOwn(context, "excerpt"), false);
+  assert.equal(Object.hasOwn(context, "documentContext"), false);
+  assert.equal(Object.hasOwn(context, "recentPublishedFeedback"), false);
   assert.match(context.reviewToken, /^review-/);
-  const compactContext = JSON.parse(contextCall.result.content[0].text);
-  assert.equal(compactContext.reviewToken, context.reviewToken);
-  assert.equal(Object.hasOwn(compactContext, "excerpt"), false);
-  assert.equal(Object.hasOwn(compactContext, "documentContext"), false);
-  assert.ok(contextCall.result.content[0].text.length < 1_000);
+  const compactStart = JSON.parse(startCall.result.content[0].text);
+  assert.equal(compactStart.monitorId, started.monitorId);
+  assert.equal(Object.hasOwn(compactStart, "path"), false);
 
-  const reusedContextCall = await client.request("tools/call", {
+  const recoveryContextCall = await client.request("tools/call", {
     name: "read_review_context",
-    arguments: { monitorId: started.monitorId, revision: 0 },
+    arguments: { monitorId: started.monitorId },
   });
-  assert.equal(reusedContextCall.result.structuredContent.reviewToken, context.reviewToken);
-  assert.equal(reusedContextCall.result.structuredContent.leaseExpiresAt, context.leaseExpiresAt);
-  assert.equal(reusedContextCall.result.structuredContent.reused, true);
+  const recoveryContext = recoveryContextCall.result.structuredContent;
+  assert.equal(recoveryContext.reviewToken, context.reviewToken);
+  assert.equal(recoveryContext.leaseExpiresAt, context.leaseExpiresAt);
+  assert.equal(recoveryContext.reused, true);
+  assert.equal(recoveryContext.documentContext.content, context.input.content);
+  assert.equal(
+    recoveryContext.documentContext.totalCharacters,
+    context.input.totalCharacters,
+  );
+  assert.equal(Object.hasOwn(recoveryContext, "input"), false);
+  const compactContext = JSON.parse(recoveryContextCall.result.content[0].text);
+  assert.equal(compactContext.reviewToken, context.reviewToken);
+  assert.equal(Object.hasOwn(compactContext, "input"), false);
+  assert.ok(recoveryContextCall.result.content[0].text.length < 1_000);
+
+  const reusedStartCall = await client.request("tools/call", {
+    name: "start_monitor",
+    arguments: { path: target },
+  });
+  const reusedStart = reusedStartCall.result.structuredContent;
+  assert.equal(reusedStart.reused, true);
+  assert.equal(reusedStart.reviewContext.reviewToken, context.reviewToken);
+  assert.equal(reusedStart.reviewContext.leaseExpiresAt, context.leaseExpiresAt);
+  assert.equal(reusedStart.reviewContext.reused, true);
 
   const publishCall = await client.request("tools/call", {
     name: "publish_feedback",
@@ -234,17 +263,23 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
       reviewToken: context.reviewToken,
       revision: context.revision,
       contentHash: context.contentHash,
-      feedback: "Natural-language baseline feedback",
     },
   });
   const published = publishCall.result.structuredContent;
   assert.equal(published.state, "published");
   assert.equal(published.fieldArtifactId, null);
   assert.equal(published.publishedRevision, 0);
-  assert.equal(published.feedback, "Natural-language baseline feedback");
+  assert.equal(published.feedback, null);
   const compactPublished = JSON.parse(publishCall.result.content[0].text);
   assert.equal(compactPublished.feedbackArtifactId, published.feedbackArtifactId);
   assert.equal(Object.hasOwn(compactPublished, "feedback"), false);
+
+  const publishedReuseCall = await client.request("tools/call", {
+    name: "start_monitor",
+    arguments: { path: target },
+  });
+  assert.equal(publishedReuseCall.result.structuredContent.reused, true);
+  assert.equal(publishedReuseCall.result.structuredContent.reviewContext, null);
 
   const statusCall = await client.request("tools/call", {
     name: "get_status",
@@ -258,6 +293,7 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
     arguments: { monitorId: started.monitorId, afterRevision: 0, timeoutMs: 0 },
   });
   assert.equal(waitCall.result.structuredContent.state, "timeout");
+  assert.equal(Object.hasOwn(waitCall.result.structuredContent, "reviewContext"), false);
 
   const savedAt = Date.now();
   await writeFile(target, `${"x".repeat(99_999)}y`, "utf8");
@@ -272,18 +308,52 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
   assert.equal(changedCall.result.structuredContent.state, "saved");
   assert.equal(changedCall.result.structuredContent.event.type, "changed");
   assert.equal(changedCall.result.structuredContent.event.revision, 1);
-  assert.ok(Date.now() - savedAt < 750, "default polling did not detect the save quickly");
+  assert.ok(Date.now() - savedAt < 250, "25ms default polling did not detect the save quickly");
 
   const changed = changedCall.result.structuredContent.event;
-  const changedContextCall = await client.request("tools/call", {
+  const changedContext = changedCall.result.structuredContent.reviewContext;
+  assert.equal(changedContext.revision, 1);
+  assert.equal(changedContext.contentHash, changed.contentHash);
+  assert.equal(changedContext.sourceKind, "diff");
+  assert.equal(changedContext.sourceArtifactId, changed.diffArtifactId);
+  assert.equal(changedContext.input.kind, "diff");
+  assert.equal(typeof changedContext.input.content, "string");
+  assert.ok(changedContext.input.content.length > 0);
+  assert.deepEqual(changedContext.input.changedRanges, changed.changedRanges);
+  assert.deepEqual(Object.keys(changedContext.input).sort(), [
+    "changedRanges",
+    "content",
+    "kind",
+    "truncated",
+  ]);
+  assert.equal(Object.hasOwn(changedContext, "excerpt"), false);
+  assert.equal(Object.hasOwn(changedContext, "documentContext"), false);
+  assert.equal(Object.hasOwn(changedContext, "recentPublishedFeedback"), false);
+
+  const changedRecoveryCall = await client.request("tools/call", {
     name: "read_review_context",
     arguments: { monitorId: started.monitorId, revision: 1 },
   });
-  const changedContext = changedContextCall.result.structuredContent;
-  assert.equal(changedContext.sourceKind, "diff");
-  assert.equal(changedContext.sourceArtifactId, changed.diffArtifactId);
-  assert.equal(changedContext.recentPublishedFeedback.length, 1);
-  assert.equal(changedContext.recentPublishedFeedback[0].revision, 0);
+  const changedRecovery = changedRecoveryCall.result.structuredContent;
+  assert.equal(changedRecovery.reviewToken, changedContext.reviewToken);
+  assert.equal(changedRecovery.leaseExpiresAt, changedContext.leaseExpiresAt);
+  assert.equal(changedRecovery.reused, true);
+  assert.equal(changedRecovery.excerpt.content, changedContext.input.content);
+  assert.deepEqual(
+    changedRecovery.excerpt.changedRanges,
+    changedContext.input.changedRanges,
+  );
+  assert.equal(Object.hasOwn(changedRecovery, "input"), false);
+
+  const unpublishedReuseCall = await client.request("tools/call", {
+    name: "start_monitor",
+    arguments: { path: target },
+  });
+  assert.equal(unpublishedReuseCall.result.structuredContent.reused, true);
+  assert.equal(
+    unpublishedReuseCall.result.structuredContent.reviewContext.reviewToken,
+    changedContext.reviewToken,
+  );
 
   const changedPublishCall = await client.request("tools/call", {
     name: "publish_feedback",
@@ -296,6 +366,31 @@ test("serves the 0.5.0 six-tool inline review lifecycle over JSONL stdio", async
     },
   });
   assert.equal(changedPublishCall.result.structuredContent.publishedRevision, 1);
+
+  const changedPublishedReuseCall = await client.request("tools/call", {
+    name: "start_monitor",
+    arguments: { path: target },
+  });
+  assert.equal(changedPublishedReuseCall.result.structuredContent.reviewContext, null);
+
+  await writeFile(target, `${"x".repeat(99_998)}yz`, "utf8");
+  const secondChangedCall = await client.request("tools/call", {
+    name: "wait_for_save",
+    arguments: { monitorId: started.monitorId, afterRevision: 1, timeoutMs: 3_000 },
+  });
+  const secondContext = secondChangedCall.result.structuredContent.reviewContext;
+  const nullPublishCall = await client.request("tools/call", {
+    name: "publish_feedback",
+    arguments: {
+      monitorId: started.monitorId,
+      reviewToken: secondContext.reviewToken,
+      revision: secondContext.revision,
+      contentHash: secondContext.contentHash,
+      feedback: null,
+    },
+  });
+  assert.equal(nullPublishCall.result.structuredContent.state, "published");
+  assert.equal(nullPublishCall.result.structuredContent.feedback, null);
 
   const hiddenToolCall = await client.request("tools/call", {
     name: "read_revision",
@@ -363,4 +458,12 @@ test("honors JSON-RPC cancellation for a long wait", async () => {
   client.notify("notifications/cancelled", { requestId, reason: "test cancellation" });
   const cancelled = await waiting;
   assert.equal(cancelled.result.structuredContent.state, "cancelled");
+  assert.equal(
+    Object.hasOwn(cancelled.result.structuredContent, "reviewContext"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(cancelled.result.structuredContent, "reviewContext"),
+    false,
+  );
 });

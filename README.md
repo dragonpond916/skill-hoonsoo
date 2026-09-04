@@ -17,10 +17,11 @@
 - `$sherpa <filepath> <prompt>` 하나로 완결성·일관성·위험·누락과 문법·맞춤법·문장부호·스타일을 함께 검토
 - 편집기의 저장되지 않은 버퍼가 아닌, 디스크에 반영된 상태만 감지
 - metadata와 raw content hash를 함께 비교하여 같은 크기의 내용 교체와 atomic save도 판별
-- 저장 즉시 deterministic Monitor/DiffChecker가 snapshot과 변경 범위를 session memory에 versioning
+- 25 ms metadata polling과 raw content hash로 저장을 빠르게 확인하고, deterministic Monitor/DiffChecker가 snapshot과 변경 범위를 session memory에 versioning
 - 공백·탭·줄바꿈만 바뀐 저장도 문법·스타일 검토 대상으로 포함
 - 같은 raw content를 다시 저장한 경우 새 revision이나 LLM 검토를 만들지 않음
-- 한 번의 current-host LLM pass와 원자적 publish gate로 최신 저장본만 출력
+- baseline은 한 번만 전달되는 bounded document input으로, 이후 저장본은 diff-only input으로 검토
+- 한 번의 current-host LLM pass에서 1~3개의 짧은 조언을 출력하고 publish gate를 함께 호출
 - 응답 공개 후 1분간 내용 변경이 없으면 안내하고, 추가 30초 뒤 자동 종료
 
 출력은 내부 revision을 노출하지 않고 다음처럼 자연어만 사용합니다.
@@ -118,11 +119,21 @@ Claude Code에서는 재시작하거나 `/reload-plugins`를 실행한 뒤 호�
 
 경로에 공백이 있다면 따옴표로 감쌉니다. prompt는 선택값이며 생략해도 내용과 문법을 모두 검토합니다.
 
+### Codex 저지연 권장 설정
+
+문서 감시 전용 Codex task를 만들고 다음 조합으로 실행하는 것을 권장합니다.
+
+- 모델: `gpt-5.6-luna`
+- reasoning effort: `low`
+- fast mode: `/fast on`
+
+Sherpa 플러그인은 현재 Codex task의 모델, reasoning effort, fast mode를 직접 선택하거나 변경할 수 없습니다. 이 설정은 사용자가 Codex에서 지정해야 합니다. 문서 편집기의 autosave를 켜면 입력이 디스크에 반영되기까지의 시간을 줄일 수 있지만, 아직 저장되지 않은 편집기 buffer는 Sherpa가 볼 수 없습니다.
+
 ### 권장 시운전
 
-1. 시작 직후 baseline 조언이 자연어로 출력되고 `revision:` 같은 내부 라벨이 보이지 않는지 확인합니다.
+1. 시작 직후 하나의 bounded document input으로 baseline 조언이 자연어로 출력되고 `revision:` 같은 내부 라벨이 보이지 않는지 확인합니다.
 2. 외부 편집기에서 입력만 하고 저장하지 않았을 때 새 조언이 없는지 확인합니다.
-3. 저장하면 빠르게 하나의 통합 조언이 나오는지 확인합니다.
+3. 저장하면 전체 문서 재전송 없이 변경 diff만으로 1~3개의 짧은 통합 조언이 나오는지 확인합니다.
 4. 같은 byte 길이의 단어를 바꾸어 저장해도 감지되는지 확인합니다.
 5. 공백·탭·줄바꿈만 바꿔 저장해도 검토되는지 확인합니다.
 6. 내용 변경 없이 다시 저장했을 때 LLM 검토가 생기지 않는지 확인합니다.
@@ -134,20 +145,24 @@ Claude Code에서는 재시작하거나 `/reload-plugins`를 실행한 뒤 호�
 
 ```text
 active host agent
-  -> Monitor + DiffChecker (deterministic, 250ms polling)
+  -> Monitor + DiffChecker (deterministic 25ms metadata polling)
        └─ metadata + raw content hash + saved snapshot/diff
-  -> read_review_context
-       └─ prompt + bounded document context + aggregate diff + prior feedback
-       └─ analysis lease 시작: 검토 중 idle warning/stop 일시 정지
+  -> start_monitor
+       └─ baseline reviewContext: bounded document input 하나
+  -> wait_for_save
+       └─ saved reviewContext: aggregate diff-only input
+       └─ reviewContext 반환 시 analysis lease 시작
   -> current host model (single combined pass)
-       └─ 분야 판단 + 내용 + 문법 조언
-  -> publish_feedback (revision/hash/token CAS)
-       └─ 최신 결과만 공개하고 idle clock 재시작
+       └─ 같은 assistant phase에서 1~3개 자연어 조언 출력 + publish_feedback 호출
+  -> publish_feedback (reviewContext identity/CAS fields)
+       └─ feedback 본문은 선택값, 성공 시 idle clock 재시작
   -> wait_for_save (45초 bounded wait, timeout은 조용히 재시도)
        └─ 60초 warning -> 90초 stop
 ```
 
-정상적인 baseline은 `start_monitor → read_review_context → 한 번의 review → publish_feedback → wait_for_save`로 처리합니다. 이후 저장은 `wait_for_save → read_review_context → 한 번의 review → publish_feedback` 흐름입니다. `get_status`는 취소·오류 진단·복구에만 사용합니다.
+정상적인 baseline은 `start_monitor(reviewContext 포함) → 한 번의 review와 publish_feedback → wait_for_save`로 처리합니다. 이후 저장은 `wait_for_save(diff-only reviewContext 포함) → 한 번의 review와 publish_feedback` 흐름입니다. 조언 출력과 `publish_feedback` 호출은 하나의 assistant phase에서 수행하며, publication 확인만을 위한 별도 review pass를 만들지 않습니다.
+
+`read_review_context`는 정상 경로에서 호출하지 않습니다. 오래된 host와의 호환, 누락된 embedded context 진단, 오류 복구에만 사용합니다. `get_status`도 취소·오류 진단·복구에만 사용합니다.
 
 runtime이 공개하는 MCP 도구는 정확히 다음 여섯 개입니다.
 
@@ -160,6 +175,8 @@ runtime이 공개하는 MCP 도구는 정확히 다음 여섯 개입니다.
 
 `wait_for_save`는 일반적인 60초 MCP tool timeout보다 짧은 45초 단위로 기다립니다. timeout 자체는 사용자에게 표시하지 않고 즉시 다시 기다립니다. 작은 도구 호출이 조금 늘 수 있지만, host timeout으로 감시가 끊기는 위험을 줄입니다.
 
+`reviewContext.input`은 baseline이나 rebaseline에서 `{ kind: "document", content, truncated, totalCharacters }`, 일반 저장에서 `{ kind: "diff", content, truncated, changedRanges }` 형태입니다. 저장 revision에는 전체 문서나 이전 feedback을 반복해서 싣지 않아 장시간 감시에서도 model context가 불필요하게 커지지 않도록 합니다. `publish_feedback`에는 `reviewContext`가 돌려준 identity/CAS 필드만 그대로 전달하며, feedback 본문은 tool schema가 요구할 때만 포함합니다.
+
 ### 선택적으로 유용한 MCP·플러그인
 
 기본 감시에는 Sherpa MCP 하나만 필요합니다. 실제 근거가 필요할 때만 GitHub/GitLab, Atlassian Rovo, Figma, Google Drive·Dropbox·Box, 공식 문서 같은 이미 연결된 읽기 전용 자료를 사용하거나 추천합니다. Sherpa가 자동 설치하거나 연결하지는 않습니다.
@@ -167,7 +184,7 @@ runtime이 공개하는 MCP 도구는 정확히 다음 여섯 개입니다.
 ## 현실적인 제약
 
 - 능동 loop는 현재 agent turn이 실행 중일 때만 유지됩니다. 호스트의 final 응답이나 90초 idle 종료 뒤에는 다시 Sherpa를 호출해야 합니다.
-- 파일시스템은 수동 Save와 autosave를 구분하지 못합니다. 둘 다 디스크 저장으로 처리합니다.
+- 파일시스템은 수동 Save와 autosave를 구분하지 못합니다. 둘 다 디스크 저장으로 처리하며, autosave는 더 빠른 피드백에 도움이 될 수 있습니다.
 - 저장되지 않은 편집기 버퍼는 감지하지 않습니다. 외부 formatter가 파일을 쓰면 저장 revision으로 감지될 수 있습니다.
 - 매우 빠른 여러 저장이 운영체제에서 하나의 상태로 합쳐지면 관찰되지 않은 중간 상태는 복원할 수 없습니다.
 - snapshot, diff, review token, feedback은 하나의 MCP process memory에만 있고 monitor나 process가 끝나면 폐기됩니다.
@@ -183,7 +200,7 @@ npm run package:plugin
 npm test
 ```
 
-테스트는 6-tool 공개 계약, save detection, revision/hash CAS, 분석 lease와 idle lifecycle, Codex·Claude manifest, 배포본 byte 동기화를 확인합니다.
+테스트는 6-tool 공개 계약, embedded baseline/diff-only `reviewContext`, 25 ms save detection, revision/hash CAS, 분석 lease와 60/90초 idle lifecycle, Codex·Claude manifest, 배포본 byte 동기화를 확인합니다.
 
 ```text
 skill-sherpa/

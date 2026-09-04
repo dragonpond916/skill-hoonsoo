@@ -5,7 +5,7 @@ description: Monitor one local text document after disk-backed saves and provide
 
 # Sherpa
 
-Monitor one local document and give read-only content and grammar advice for its baseline and every saved revision. Optimize for save-to-feedback latency: use the current host model for one combined review pass over one MCP-provided context bundle.
+Monitor one local document and give read-only content and grammar advice for its baseline and every saved revision. Optimize for save-to-feedback latency: use the current host model for one combined review pass over the single `reviewContext` supplied by the monitoring call.
 
 ## Safety boundary
 
@@ -23,20 +23,20 @@ $sherpa <filepath> <prompt>
 /skill-sherpa:sherpa <filepath> <prompt>
 ```
 
-The first argument is the target path; the remaining text is an optional review focus. Quote paths containing spaces. Resolve exactly one absolute target. At startup, state the absolute path briefly and say that “세르파 중지”, “stop Sherpa”, or equivalent language stops monitoring. Accept the former Korean stop phrase “훈수중지” as a deprecated cancellation synonym during the 0.5 transition.
+The first argument is the target path; the remaining text is an optional review focus. Quote paths containing spaces. Resolve exactly one absolute target. At startup, state the absolute path briefly and say that “세르파 중지”, “stop Sherpa”, or equivalent language stops monitoring.
 
 Every review combines:
 
 - content: meaning, completeness, consistency, clarity, risk, missing assumptions, and actionability;
 - grammar: file syntax, natural-language grammar, spelling, punctuation, style, terminology, whitespace, and formatting.
 
-Do not expose separate context and grammar modes. The optional prompt adds priorities but never disables either review dimension.
+Do not expose separate content and grammar modes. The optional prompt adds priorities but never disables either review dimension.
 
 ## Save semantics
 
-React only to a new state persisted to disk. Size alone is insufficient; the deterministic runtime combines metadata with a raw-content hash, so same-size replacements and atomic saves remain detectable.
+React only to a new state persisted to disk. The deterministic runtime probes metadata every 25 ms, then validates the raw-content hash. Same-size replacements and atomic saves remain detectable.
 
-The operating system cannot reliably distinguish manual save from autosave. Both count as disk-backed saves. A metadata-only save with the same raw-content hash creates neither a revision nor a model review. Whitespace-only changes are valid because grammar and formatting are in scope.
+The operating system cannot reliably distinguish manual save from autosave. Both count as disk-backed saves. Autosave can shorten the delay from typing to review, but an unsaved editor buffer is invisible to Sherpa. A metadata-only save with the same raw-content hash creates neither a revision nor a model review. Whitespace-only changes are valid because grammar and formatting are in scope.
 
 There is no debounce, throttling, or quiet window. The runtime may retry a read that overlaps an in-progress write only to obtain a consistent snapshot.
 
@@ -44,20 +44,26 @@ There is no debounce, throttling, or quiet window. The runtime may retry a read 
 
 - Never spawn or delegate to a subagent for a Sherpa review. MCP session memory is process-local and is not a cross-agent message bus.
 - The current host model performs field inference, content review, and grammar review together in one pass per published revision.
-- Use the complete bundle returned by `read_review_context`; do not reread the target, repeat status checks, page through artifacts, or perform a second review.
-- Do not say that a specialist agent cannot share memory, that a fallback model is being used, or otherwise narrate internal routing.
-- Prefer one sufficiently complete review input over many small tool calls. This intentionally spends somewhat more input tokens to reduce latency.
+- `start_monitor` embeds the baseline `reviewContext`; `wait_for_save` embeds the newest saved-revision `reviewContext`.
+- The baseline context contains one bounded document input. A saved-revision context contains only the aggregate changed diff; do not request or reread the full document.
+- Do not call `read_review_context` in the normal path. It exists only for compatibility, diagnosis, or recovery when an embedded context is missing or invalid.
+- Using only the embedded context, produce one to three concise natural-language findings. In the same assistant phase, show those findings and call `publish_feedback` with the returned identity and compare-and-set fields. Omit the feedback body unless the runtime explicitly requires it.
+- Do not repeat status checks, page through artifacts, reread the target, or perform a second review.
 - Keep monitoring, stable reads, hashes, diffs, revision ordering, compare-and-set validation, and idle timers deterministic and model-free.
+
+## Codex latency setup
+
+For the lowest interactive latency, recommend a dedicated Codex task using `gpt-5.6-luna`, low reasoning effort, and `/fast on`. Make this recommendation once, not after every save. The plugin cannot select or change the host task's model, reasoning effort, or fast-mode setting; the user must configure them in Codex.
 
 ## Runtime tools
 
-The Sherpa MCP exposes exactly this fast-path surface:
+The Sherpa MCP exposes exactly six tools:
 
-- `start_monitor`: start or reuse one target monitor and capture internal revision zero.
-- `read_review_context`: return prompt, bounded current context, current revision or aggregate diff, relevant prior feedback, and a short-lived review token in one call.
-- `publish_feedback`: atomically validate the review token, revision, and content hash, store the feedback in session memory, and mark it published.
-- `wait_for_save`: wait locally for a saved revision or lifecycle event.
-- `get_status`: use only for cancellation, error diagnosis, or recovery; it is not part of the normal review path.
+- `start_monitor`: start or reuse one target monitor, capture internal revision zero, and return its embedded baseline `reviewContext`.
+- `wait_for_save`: wait locally for a saved revision or lifecycle event and return a diff-only `reviewContext` with a changed revision.
+- `publish_feedback`: validate the identifiers from `reviewContext`, mark that review published, and restart the idle clock. The natural-language feedback body is optional.
+- `read_review_context`: compatibility and recovery access when a normal monitoring response lacks a usable embedded context.
+- `get_status`: cancellation, error diagnosis, and recovery only.
 - `stop_monitor`: stop the monitor and release timers and session memory.
 
 If these tools are unavailable, report that the plugin must be installed or reloaded. Do not simulate monitoring with repeated shell or filesystem calls.
@@ -65,28 +71,25 @@ If these tools are unavailable, report that the plugin must be installed or relo
 ## Baseline workflow
 
 1. Call `start_monitor` with the absolute path and invocation prompt.
-2. Call `read_review_context` for the returned monitor. This starts an analysis lease, which pauses idle warning and shutdown while review is in progress.
-3. Using only that bundle, perform one direct, combined content-and-grammar review with the current host model.
-4. Call `publish_feedback` with the exact `reviewToken`, `revision`, `contentHash`, and natural-language feedback. This compare-and-set operation rejects obsolete work and restarts the idle clock at publication.
-5. If publication succeeds, show the exact feedback using the output format below.
-6. Call `wait_for_save` with `afterRevision` equal to the last published revision and `timeoutMs: 45000`.
+2. Review only its embedded `reviewContext`, which contains one bounded document input and an analysis lease.
+3. In one assistant phase, output one to three concise findings in the format below and call `publish_feedback` using the exact `monitorId`, `reviewToken`, `revision`, and `contentHash`. Include `feedback` only when required by the tool schema.
+4. After publication, call `wait_for_save` with `afterRevision` equal to the last published revision and `timeoutMs: 45000`.
 
-The 45-second wait stays below the normal 60-second MCP tool timeout. A plain timeout produces no user-visible message; immediately call the same wait again. This small tool-call cost is intentional and prevents a host timeout from breaking the monitor.
+The 45-second wait stays below the normal 60-second MCP tool timeout. A plain timeout produces no user-visible message; immediately call the same wait again.
 
 ## Saved-revision loop
 
 For every saved revision event:
 
-1. Call `read_review_context` for the newest revision. The bundle contains either its aggregate changed ranges or, when rebaselining is required, bounded current-document context.
-2. Perform exactly one direct combined review.
-3. Call `publish_feedback` with the exact token, revision, and hash.
-4. On success, display the numbered feedback and wait again with `timeoutMs: 45000`.
+1. Review only the diff-only `reviewContext` embedded by `wait_for_save`. Do not call `read_review_context`.
+2. In one assistant phase, output one to three concise findings and call `publish_feedback` with the exact returned identity fields; the feedback body is optional.
+3. On success, resume `wait_for_save` with `timeoutMs: 45000` without an extra status call or user-visible progress message.
 
-If `publish_feedback` rejects a stale token because a newer save arrived, do not display or merge the obsolete result. Immediately call `read_review_context` for the newest revision and review that bundle. Do not call `get_status` merely to preflight a publish; the publish operation is the authoritative gate.
+If publication reports stale context because a newer save arrived, immediately call `wait_for_save` with `afterRevision` equal to the obsolete revision and `timeoutMs: 0`, then review its newest embedded context. Use `read_review_context` only when recovery is impossible from an embedded context, and never call `get_status` merely to preflight publication.
 
 ## Analysis lease and idle lifecycle
 
-Reading review context issues an internal lease. While the lease is active, idle warning and automatic stop are paused. A successful publish ends the lease and starts a fresh idle period. If a review is abandoned, the bounded lease expires and the idle clock starts then, so the monitor cannot remain alive forever.
+Returning an embedded review context issues an internal analysis lease. While the lease is active, idle warning and automatic stop are paused. A successful publication ends the lease and starts a fresh idle period. If a review is abandoned, the bounded lease expires and the idle clock starts then.
 
 While waiting after publication:
 
@@ -107,7 +110,7 @@ Waiting happens inside the local runtime. Never create visible heartbeat message
 
 ## Natural-language output
 
-Maintain a one-based batch counter. For feedback, use only:
+Maintain a one-based batch counter. Each review contains at most three concise findings and uses only:
 
 ```text
 세르파의 {n}번째 조언 :
@@ -115,7 +118,7 @@ Maintain a one-based batch counter. For feedback, use only:
 현재 저장본에서 확인한 내용과 문법상의 문제를 사람이 설명하듯 자연스럽게 서술합니다. 왜 중요한지와 사용자가 취할 수 있는 구체적인 조치를 함께 담습니다.
 ```
 
-Do not display `revision:` or any internal revision, token, hash, artifact, model, routing, or key-value field. Do not expose `anchor:`, `category:`, `severity:`, `message:`, `rationale:`, `suggestedAction:`, or `confidence:`. Multiple findings may use readable paragraphs or a short numbered list. If nothing is actionable, say so briefly.
+Do not display `revision:` or any internal revision, token, hash, artifact, model, routing, or key-value field. Do not expose `anchor:`, `category:`, `severity:`, `message:`, `rationale:`, `suggestedAction:`, or `confidence:`. If nothing is actionable, say so in one short sentence.
 
 ## Optional context
 
@@ -123,4 +126,4 @@ Sherpa needs no plugin beyond its own MCP. If grounded advice genuinely needs ex
 
 ## Stop conditions
 
-Stop on explicit cancellation, target deletion or unreadability, runtime failure, session end, or the idle stop. On a controllable stop, call `stop_monitor`. A later run must invoke Sherpa again.
+Stop on explicit cancellation, target deletion or unreadability, runtime failure, session end, or the 90-second idle stop. On a controllable stop, call `stop_monitor`. A later run must invoke Sherpa again.

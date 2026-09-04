@@ -1,14 +1,14 @@
 {
   "name": "skill-sherpa",
   "displayName": "Sherpa",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Sherpa gives fast read-only content and grammar guidance for saved local document revisions.",
   "author": {
     "name": "dragonpond",
     "url": "https://github.com/dragonpond916"
   },
-  "homepage": "https://github.com/dragonpond916/skill-hoonsoo",
-  "repository": "https://github.com/dragonpond916/skill-hoonsoo",
+  "homepage": "https://github.com/dragonpond916/skill-sherpa",
+  "repository": "https://github.com/dragonpond916/skill-sherpa",
   "keywords": [
     "review",
     "context",

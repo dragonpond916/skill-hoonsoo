@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectDirectory = path.resolve(currentDirectory, "../..");
 const packageDirectory = path.join(projectDirectory, "plugins", "skill-sherpa");
+const expectedVersion = "0.6.0";
+const canonicalRepository = "https://github.com/dragonpond916/skill-sherpa";
+const legacyIdentity = /hoonsoo|훈수/iu;
 
 async function readJson(...segments) {
   return JSON.parse(await readFile(path.join(...segments), "utf8"));
@@ -61,7 +64,7 @@ async function smokeTestMcp(server, host) {
       clientInfo: { name: `${host}-package-test`, version: "1.0.0" },
     });
     assert.equal(response.result.serverInfo.name, "sherpa", stderr);
-    assert.equal(response.result.serverInfo.version, "0.5.0", stderr);
+    assert.equal(response.result.serverInfo.version, expectedVersion, stderr);
   } finally {
     child.stdin.end();
     child.kill("SIGTERM");
@@ -98,20 +101,20 @@ test("package contains only the install-time files", async () => {
   const claudeManifest = await readJson(packageDirectory, ".claude-plugin", "plugin.json");
   assert.equal(codexManifest.name, "skill-sherpa");
   assert.equal(claudeManifest.name, codexManifest.name);
-  assert.equal(codexManifest.version, "0.5.0");
+  assert.equal(codexManifest.version, expectedVersion);
   assert.equal(claudeManifest.version, codexManifest.version);
+  assert.equal(codexManifest.homepage, canonicalRepository);
+  assert.equal(codexManifest.repository, canonicalRepository);
+  assert.equal(claudeManifest.homepage, canonicalRepository);
+  assert.equal(claudeManifest.repository, canonicalRepository);
   assert.equal(codexManifest.mcpServers.sherpa.cwd, ".");
   assert.equal(claudeManifest.mcpServers, "./claude.mcp.json");
 
   for (const relativePath of packagedFiles) {
     const content = await readFile(path.join(packageDirectory, relativePath), "utf8");
-    const withoutLegacyRepositoryUrl = content.replaceAll(
-      "https://github.com/dragonpond916/skill-hoonsoo",
-      "",
-    );
     assert.doesNotMatch(
-      withoutLegacyRepositoryUrl,
-      /\bHoonsoo\b|\$hoonsoo|skill-hoonsoo|skills\/hoonsoo|scripts\/hoonsoo/,
+      content,
+      legacyIdentity,
       `legacy identity remains in ${relativePath}`,
     );
   }

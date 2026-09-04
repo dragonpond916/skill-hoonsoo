@@ -20,7 +20,7 @@ export const IDLE_WARNING_MESSAGE =
   "1분간 작업이 감지되지 않았습니다. 30초 더 기다린 후 세르파 모드가 정지됩니다.\n" +
   "나중에 다시 시작하려면 $sherpa를 호출해주세요.";
 
-const DEFAULT_POLL_INTERVAL_MS = 250;
+const DEFAULT_POLL_INTERVAL_MS = 25;
 const READ_RETRY_DELAY_MS = 25;
 const DEFAULT_CONTEXT_LINES = 5;
 const MAX_EVENT_HISTORY = 64;
@@ -40,14 +40,14 @@ const MAX_REVIEW_HISTORY_ITEMS = 10;
 const MAX_REVIEW_HISTORY_CHARACTERS = 24_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const SERVER_NAME = "sherpa";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const TOOL_DEFINITIONS = [
   {
     name: "start_monitor",
     description:
-      "Start an in-memory, read-only monitor for one UTF-8 regular file. The path must be absolute. This tool never writes to the target or workspace.",
+      "Start an in-memory, read-only monitor for one UTF-8 regular file and return its first reviewContext inline. The path must be absolute. This tool never writes to the target or workspace.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -59,7 +59,7 @@ const TOOL_DEFINITIONS = [
           maxLength: MAX_PROMPT_CHARACTERS,
           description: "Optional combined content-and-grammar review instruction.",
         },
-        pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 250 },
+        pollIntervalMs: { type: "integer", minimum: 25, maximum: 60_000, default: 25 },
         contextLines: { type: "integer", minimum: 0, maximum: 50, default: 5 },
       },
     },
@@ -74,7 +74,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "read_review_context",
     description:
-      "Read one current, bounded inline-review context and acquire a time-bounded analysis lease. Use it from the current host; do not delegate the review to a subagent.",
+      "Recovery-only compatibility tool. Read the latest bounded review context and acquire or reuse its analysis lease when start_monitor or wait_for_save did not supply reviewContext.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -99,17 +99,23 @@ const TOOL_DEFINITIONS = [
   {
     name: "publish_feedback",
     description:
-      "CAS-validate one inline review lease, atomically publish feedback, and restart the user-idle clock.",
+      "CAS-validate one inline review lease, mark the visible review as published, and restart the user-idle clock. The feedback body is optional because the host may already have shown it.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["monitorId", "reviewToken", "revision", "contentHash", "feedback"],
+      required: ["monitorId", "reviewToken", "revision", "contentHash"],
       properties: {
         monitorId: { type: "string" },
         reviewToken: { type: "string" },
         revision: { type: "integer", minimum: 0 },
         contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
-        feedback: { type: "string", minLength: 1, maxLength: MAX_FEEDBACK_CHARACTERS },
+        feedback: {
+          anyOf: [
+            { type: "string", minLength: 1, maxLength: MAX_FEEDBACK_CHARACTERS },
+            { type: "null" },
+          ],
+          description: "Optional legacy copy of the already visible feedback.",
+        },
       },
     },
     annotations: {
@@ -123,7 +129,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "wait_for_save",
     description:
-      "Wait locally until a saved content revision, the 60-second idle warning, the 90-second idle stop, cancellation, or an optional timeout. Same-content saves do not wake this call or reset content-idle time.",
+      "Wait locally until a saved content revision, the 60-second idle warning, the 90-second idle stop, cancellation, or an optional timeout. A saved result includes reviewContext inline. Same-content saves do not wake this call or reset content-idle time.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -846,7 +852,11 @@ export class MonitorSession {
           50,
         );
       }
-      return { ...this.#status(active), reused: true };
+      const reviewContext =
+        active.publishedRevision < active.revision
+          ? this.#inlineReviewContext(active, active.revision)
+          : null;
+      return { ...this.#status(active), reused: true, reviewContext };
     }
 
     const pollIntervalMs = integerOption(
@@ -915,7 +925,8 @@ export class MonitorSession {
     this.activeByPath.set(targetPath, monitor.id);
     this.#restartPollTimer(monitor);
     this.#scheduleIdleTimer(monitor);
-    return { ...this.#status(monitor), reused: false };
+    const reviewContext = this.#inlineReviewContext(monitor, 0);
+    return { ...this.#status(monitor), reused: false, reviewContext };
   }
 
   readRevision(input) {
@@ -1032,6 +1043,39 @@ export class MonitorSession {
     };
   }
 
+  #inlineReviewContext(monitor, revision) {
+    const context = this.readReviewContext({ monitorId: monitor.id, revision });
+    const input =
+      context.sourceKind === "diff" && !context.rebaselineRequired
+        ? {
+            kind: "diff",
+            content: context.excerpt.content,
+            truncated: context.excerpt.truncated,
+            changedRanges: context.excerpt.changedRanges,
+          }
+        : {
+            kind: "document",
+            content: context.documentContext.content,
+            truncated: context.documentContext.truncated,
+            totalCharacters: context.documentContext.totalCharacters,
+          };
+    return {
+      state: context.state,
+      monitorId: context.monitorId,
+      reviewToken: context.reviewToken,
+      revision: context.revision,
+      contentHash: context.contentHash,
+      prompt: context.prompt,
+      sourceArtifactId: context.sourceArtifactId,
+      sourceKind: context.sourceKind,
+      input,
+      publishedRevision: context.publishedRevision,
+      rebaselineRequired: context.rebaselineRequired,
+      leaseExpiresAt: context.leaseExpiresAt,
+      reused: context.reused,
+    };
+  }
+
   publishFeedback(input) {
     const args = assertObject(input);
     const monitor = this.#requireMonitor(args.monitorId);
@@ -1044,11 +1088,14 @@ export class MonitorSession {
       Number.MAX_SAFE_INTEGER,
     );
     const contentHash = requireString(args.contentHash, "contentHash");
-    const feedback = this.#boundedString(
-      args.feedback,
-      "feedback",
-      MAX_FEEDBACK_CHARACTERS,
-    );
+    const feedback =
+      args.feedback === undefined || args.feedback === null
+        ? null
+        : this.#boundedString(
+            args.feedback,
+            "feedback",
+            MAX_FEEDBACK_CHARACTERS,
+          );
 
     this.#assertCurrentRevision(monitor, revision, contentHash);
     const completed = [...monitor.feedbackArtifacts.values()].find(
@@ -1385,24 +1432,11 @@ export class MonitorSession {
             ],
           };
 
-    const recentPublishedFeedback = [];
-    let remainingCharacters = MAX_REVIEW_HISTORY_CHARACTERS;
-    const candidateIds = monitor.publishedFeedbackIds.slice(-feedbackLimit);
-    for (let index = candidateIds.length - 1; index >= 0; index -= 1) {
-      const artifact = monitor.feedbackArtifacts.get(candidateIds[index]);
-      if (!artifact || artifact.revision >= revision || remainingCharacters <= 0) continue;
-      const feedback =
-        artifact.feedback.length <= remainingCharacters
-          ? artifact.feedback
-          : artifact.feedback.slice(artifact.feedback.length - remainingCharacters);
-      remainingCharacters -= feedback.length;
-      recentPublishedFeedback.unshift({
-        feedbackArtifactId: artifact.id,
-        revision: artifact.revision,
-        feedback,
-        publishedAt: artifact.publishedAt,
-      });
-    }
+    const recentPublishedFeedback = this.#recentPublishedFeedback(
+      monitor,
+      revision,
+      feedbackLimit,
+    );
 
     return {
       monitorId: monitor.id,
@@ -1737,7 +1771,15 @@ export class MonitorSession {
     const candidateIds = monitor.publishedFeedbackIds.slice(-feedbackLimit);
     for (let index = candidateIds.length - 1; index >= 0; index -= 1) {
       const artifact = monitor.feedbackArtifacts.get(candidateIds[index]);
-      if (!artifact || artifact.revision >= revision || remainingCharacters <= 0) continue;
+      if (
+        !artifact ||
+        artifact.revision >= revision ||
+        typeof artifact.feedback !== "string" ||
+        artifact.feedback.length === 0 ||
+        remainingCharacters <= 0
+      ) {
+        continue;
+      }
       const feedback =
         artifact.feedback.length <= remainingCharacters
           ? artifact.feedback
@@ -1948,9 +1990,13 @@ export class MonitorSession {
       if (error.code !== "REVISION_NOT_AVAILABLE") throw error;
       rebaselineRequired = true;
     }
+    const reviewContext =
+      monitor.publishedRevision < monitor.revision
+        ? this.#inlineReviewContext(monitor, monitor.revision)
+        : null;
     return {
       state: "saved",
-      rebaselineRequired,
+      rebaselineRequired: reviewContext?.rebaselineRequired ?? rebaselineRequired,
       event: {
         type: latestEvent?.type ?? "changed",
         monitorId: monitor.id,
@@ -1966,6 +2012,7 @@ export class MonitorSession {
         observedAt: latestEvent?.observedAt ?? monitor.lastEventAt,
         metadata: publicMetadata(monitor.observedSnapshot?.metadata),
       },
+      reviewContext,
     };
   }
 
@@ -2282,6 +2329,26 @@ function compactToolSummary(data) {
       if (Object.hasOwn(data.event, key)) summary.event[key] = data.event[key];
     }
   }
+  if (data.reviewContext && typeof data.reviewContext === "object") {
+    summary.reviewContext = {};
+    for (const key of [
+      "state",
+      "reviewToken",
+      "revision",
+      "contentHash",
+      "sourceKind",
+      "rebaselineRequired",
+    ]) {
+      if (Object.hasOwn(data.reviewContext, key)) {
+        summary.reviewContext[key] = data.reviewContext[key];
+      }
+    }
+    if (data.reviewContext.input && typeof data.reviewContext.input === "object") {
+      summary.reviewContext.input = { kind: data.reviewContext.input.kind };
+    }
+  } else if (Object.hasOwn(data, "reviewContext")) {
+    summary.reviewContext = null;
+  }
   return summary;
 }
 
@@ -2409,7 +2476,7 @@ export function createMcpServer({ input = process.stdin, output = process.stdout
               capabilities: { tools: { listChanged: false } },
               serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
               instructions:
-                "Sherpa 0.5 uses exactly six tools in an inline current-host flow: start_monitor, read_review_context, publish_feedback, wait_for_save, get_status, and stop_monitor. The current host must perform the review itself; do not use subagents because session memory is process-local. Sherpa only reads explicitly selected UTF-8 regular files and never writes to the target or workspace.",
+                "Sherpa 0.6 uses exactly six tools. start_monitor and saved wait_for_save results carry reviewContext inline; read_review_context is recovery-only. Review on the current host, show concise feedback once, then publish its revision/hash/token without repeating the feedback body. Do not use subagents because session memory is process-local. Sherpa reads only explicitly selected UTF-8 regular files and never writes to the target or workspace.",
             }),
           );
           break;
